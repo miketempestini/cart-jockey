@@ -12,10 +12,110 @@ body {
   justify-content: center;
   height: 100vh;
   height: 100dvh;
+  font-family: system-ui, sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
 }
 
 canvas {
   display: block;
   background: #3a3d42;
   touch-action: none;
+}
+
+/* Touch controls. Hidden unless this is a touch device and a shift is running. */
+#touch {
+  display: none;
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 0 max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  justify-content: space-between;
+  align-items: flex-end;
+  pointer-events: none;
+}
+
+body.touch-ui[data-phase='playing'] #touch,
+body.touch-ui[data-phase='countdown'] #touch {
+  display: flex;
+}
+
+.stick,
+.tbtn {
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.stick {
+  position: relative;
+  width: 132px;
+  height: 132px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.12);
+  border: 2px solid rgba(255, 255, 255, 0.35);
+}
+
+.knob {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 56px;
+  height: 56px;
+  margin: -28px 0 0 -28px;
+  border-radius: 50%;
+  background: rgba(255, 138, 31, 0.85);
+  border: 2px solid rgba(0, 0, 0, 0.4);
+}
+
+.pad {
+  display: grid;
+  grid-template-columns: auto auto;
+  grid-template-rows: auto auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.tbtn {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.45);
+  background: rgba(0, 0, 0, 0.45);
+  color: #f2f2f2;
+  font: bold 12px system-ui, sans-serif;
+  line-height: 1.2;
+  padding: 0;
+}
+
+.tbtn.big {
+  grid-row: span 2;
+  width: 88px;
+  height: 88px;
+  background: rgba(255, 210, 63, 0.3);
+  border-color: rgba(255, 210, 63, 0.8);
+}
+
+.tbtn.active {
+  background: rgba(255, 255, 255, 0.35);
+}
+
+/* On a phone held upright the lot is small; suggest turning it. */
+#rotate {
+  display: none;
+  position: fixed;
+  top: max(16px, env(safe-area-inset-top));
+  left: 16px;
+  right: 16px;
+  margin: 0;
+  text-align: center;
+  color: #cfcfcf;
+  font-size: 14px;
+}
+
+@media (orientation: portrait) {
+  body.touch-ui #rotate {
+    display: block;
+  }
 }

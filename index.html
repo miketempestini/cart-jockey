@@ -2,12 +2,26 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
   <title>Lot Runner</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <canvas id="game" aria-label="Lot Runner game"></canvas>
+
+  <!-- Touch controls: shown on touch devices while a shift is running. They call
+       the same setHeld / pressAction functions as the keyboard. -->
+  <div id="touch" aria-hidden="true">
+    <div id="stick" class="stick"><div class="knob"></div></div>
+    <div class="pad">
+      <button type="button" class="tbtn" data-hold="sprint">SPRINT</button>
+      <button type="button" class="tbtn big" data-press="interact">GRAB<br>DOCK</button>
+      <button type="button" class="tbtn" data-press="dropLast">DROP</button>
+    </div>
+  </div>
+
+  <p id="rotate">Turn your phone sideways for a bigger lot</p>
+
   <script src="game.js"></script>
 </body>
 </html>

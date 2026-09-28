@@ -60,7 +60,14 @@ const CONFIG = {
   parkedMax: 32,
   trafficMaxMoving: 3, // cars driving around at once
   arriveEvery: [4, 9], // random seconds between cars arriving
-  departEvery: [5, 11], // random seconds between cars leaving
+  // Shoppers. Cars leave when their shopper comes back out of the store.
+  shopperSize: 14,
+  shopperSpeed: 44, // walking
+  shopperCartSpeed: 38, // pushing a cart
+  shopperExitEvery: [4, 9], // random seconds between shoppers leaving the store
+  maxShoppers: 7, // out in the lot at once
+  abandonChance: 0.4, // chance a shopper leaves the cart by their car instead of returning it
+  shopperReplanAfter: 1.5, // seconds stuck before a shopper walks around what's blocking them
   spotWaitMax: 6, // a car gives up on a blocked space after this long and drives out
   yieldProbe: 26, // how far ahead a car looks for another car to wait behind
   carHitTimePenalty: 5,
@@ -92,7 +99,8 @@ const ROW_COUNT = 16;
 const RAIL = 6;
 const BIN_INDEX = 7; // row C, two spaces wide
 
-const CAR_COLORS = ['#3d6fb6', '#b8423a', '#e0dccf', '#2f8a5b', '#6c6f75', '#1f2a3a', '#c9a13b', '#7a4fa0'];
+// Candy car paint: mint, butter, coral, blueberry, lilac, peach, sky, cherry.
+const CAR_COLORS = ['#7ed9b0', '#ffe08a', '#ff8a70', '#5b7fe0', '#b99af0', '#ffb38a', '#7cc8f0', '#f06c8a'];
 
 // Traffic lanes are one-way and follow the painted arrows: east along the
 // fire lane, south down the right edge, west along the bottom and the middle
@@ -345,10 +353,55 @@ const state = {
   traffic: [], // cars driving to or from spaces
   nextCarId: 1,
   arriveTimer: 0,
-  departTimer: 0,
+  shoppers: [], // people walking between their cars and the store
+  nextShopperId: 1,
+  shopperTimer: 0, // until the next shopper comes out of the store
+  pendingDepart: [], // spaces whose shopper just got in; the car leaves when traffic allows
   player: makePlayer(),
   message: null, // { text, t }
 };
+
+// Presentation-only effects: pops, dust, bubbles, stickers. Game rules write
+// events here but never read it back, so nothing in it can change play.
+const fx = {
+  time: 0,
+  lastNow: 0,
+  pops: new Map(), // cart id -> fx.time when it was latched
+  ghosts: [], // docked carts settling into the corral
+  puffs: [], // dust
+  honks: [], // "HONK" bubbles
+  sticker: null, // { text, t }
+  binFlash: 0,
+  walk: 0, // distance the player has walked, drives the waddle
+  speed: 0,
+  lastPos: null,
+};
+
+function fxLatch(cart, fromBin) {
+  fx.pops.set(cart.id, fx.time);
+  if (fromBin && !state.carts.some((c) => c.status === 'inBin')) fx.binFlash = 1.2;
+}
+
+function fxDock(carts, comboUp) {
+  for (const c of carts) {
+    fx.ghosts.push({ x: c.x + c.w / 2, y: c.y + c.h / 2, angle: c.angle, kind: c.kind, t: 0 });
+    for (let i = 0; i < 3; i++) {
+      const a = Math.random() * Math.PI * 2;
+      fx.puffs.push({ x: c.x + c.w / 2 + Math.cos(a) * 8, y: c.y + c.h / 2 + 6 + Math.sin(a) * 4, t: 0, life: 0.6 + Math.random() * 0.3 });
+    }
+  }
+  const n = carts.length;
+  let text = null;
+  if (comboUp) text = `COMBO ${comboMult()}x!`;
+  else if (n >= 5) text = 'HUGE TRAIN!';
+  else if (n >= 3) text = 'NICE TRAIN!';
+  else if (carts.some((c) => c.kind === 'stray')) text = 'STRAY SAVED!';
+  if (text) fx.sticker = { text, t: 0 };
+}
+
+function fxHonk(car) {
+  fx.honks.push({ car, t: 0 });
+}
 
 function cartsInLane(lane) {
   return state.carts.filter((c) => c.status === 'inBin' && c.lane === lane);
@@ -433,15 +486,23 @@ function resetSession() {
   state.traffic = [];
   state.nextCarId = 1;
   state.arriveTimer = randBetween(CONFIG.arriveEvery);
-  state.departTimer = randBetween(CONFIG.departEvery);
+  state.shoppers = [];
+  state.nextShopperId = 1;
+  state.shopperTimer = 2;
+  state.pendingDepart = [];
   state.player = makePlayer();
   state.message = null;
 
-  // A random lot to start: fill spaces the player isn't standing in.
+  // A random lot to start: fill spaces the player isn't standing in. Each
+  // car's shopper is already inside the store.
   const open = LOT.spaces.filter((s) => spaceClear(s));
   for (let i = 0; i < CONFIG.parkedStart && open.length; i++) {
     const s = open.splice(Math.floor(Math.random() * open.length), 1)[0];
-    state.parked.set(s.id, { color: CAR_COLORS[Math.floor(Math.random() * CAR_COLORS.length)] });
+    state.parked.set(s.id, {
+      color: CAR_COLORS[Math.floor(Math.random() * CAR_COLORS.length)],
+      look: makeLook(),
+      ownerInside: true,
+    });
   }
   for (let i = 0; i < BIN_CAPACITY; i++) spawnCartInBin();
   for (let i = 0; i < CONFIG.strayMax; i++) spawnStray();
@@ -593,8 +654,8 @@ function menuButtons() {
       ];
     case 'over':
       return [
-        { label: 'Play again', action: 'play', x: W / 2 - 166, y: 412, w: 160, h: 46 },
-        { label: 'Title', action: 'title', x: W / 2 + 6, y: 412, w: 160, h: 46 },
+        { label: 'Play again', action: 'play', x: W / 2 - 166, y: 424, w: 160, h: 46 },
+        { label: 'Title', action: 'title', x: W / 2 + 6, y: 424, w: 160, h: 46 },
       ];
     default:
       return [];
@@ -926,7 +987,7 @@ function hitsWorld(b, blockers = worldSolids()) {
 // blocks again once clear.
 function blockersFor(bodies) {
   const free = state.carts.filter((c) => c.status !== 'train');
-  const others = free.concat(vehicleBoxes()).filter((o) => !bodies.some((b) => overlaps(b, o)));
+  const others = free.concat(vehicleBoxes(), cartPusherBoxes()).filter((o) => !bodies.some((b) => overlaps(b, o)));
   return worldSolids().concat(others);
 }
 
@@ -1012,7 +1073,7 @@ function nearestFreeCart(from, range, ahead = null) {
   let best = null;
   let bestDist = range;
   for (const cart of state.carts) {
-    if (cart.status === 'train') continue;
+    if (cart.status === 'train' || cart.status === 'shopper') continue; // a shopper's cart isn't yours to take
     const cc = center(cart);
     if (ahead !== null) {
       const off = Math.abs(wrapAngle(Math.atan2(cc.y - from.y, cc.x - from.x) - ahead));
@@ -1040,6 +1101,7 @@ function cartInReturnZone(cart) {
 function attachCart(cart, anchor) {
   const p = state.player;
   const cc = center(cart);
+  const fromBin = cart.status === 'inBin';
   p.train.push({
     cartId: cart.id,
     angle: Math.atan2(cc.y - anchor.y, cc.x - anchor.x),
@@ -1050,6 +1112,7 @@ function attachCart(cart, anchor) {
   if (!pointIn(cc, LOT.corralArea)) state.freshPickup = true;
   state.best.train = Math.max(state.best.train, p.train.length);
   sfx.clank();
+  fxLatch(cart, fromBin);
 }
 
 function interact() {
@@ -1104,6 +1167,7 @@ function dockTrain() {
   const carts = trainCarts();
   const n = carts.length;
 
+  const levelBefore = state.combo.level;
   if (state.combo.timer === 0) {
     state.combo.level = 0;
     state.combo.timer = CONFIG.comboWindow;
@@ -1111,6 +1175,7 @@ function dockTrain() {
     state.combo.level = Math.min(state.combo.level + 1, CONFIG.comboMults.length - 1);
     state.combo.timer = CONFIG.comboWindow;
   }
+  fxDock(carts, state.combo.level > levelBefore);
   state.freshPickup = false;
   state.best.comboLevel = Math.max(state.best.comboLevel, state.combo.level);
 
@@ -1294,17 +1359,17 @@ function spawnArrival() {
     id: state.nextCarId++, kind: 'traffic', mode: 'toSpot', space: space.id,
     path, idx: 1, cx: path[0].x, cy: path[0].y, angle: 0, reverse: false,
     color: CAR_COLORS[Math.floor(Math.random() * CAR_COLORS.length)], wait: 0, moved: false,
+    look: makeLook(), // the shopper who gets out once it's parked
   };
   car.angle = Math.atan2(path[1].y - path[0].y, path[1].x - path[0].x);
   state.traffic.push(car);
   return car;
 }
 
-// A parked car backs out and drives off to a random entrance.
-function spawnDeparture() {
-  if (state.traffic.length >= CONFIG.trafficMaxMoving || state.parked.size <= CONFIG.parkedMin) return null;
-  const ids = [...state.parked.keys()];
-  const id = ids[Math.floor(Math.random() * ids.length)];
+// A parked car backs out and drives off to a random entrance. Called when
+// its shopper has climbed in.
+function spawnDeparture(id) {
+  if (state.traffic.length >= CONFIG.trafficMaxMoving || !state.parked.has(id)) return null;
   const space = LOT.spaceById[id];
   const { color } = state.parked.get(id);
   state.parked.delete(id);
@@ -1372,6 +1437,11 @@ function yieldingCars() {
     sees.set(v, vehicles.filter((o) => o !== v && overlaps(probe, vehicleBox(o))));
   }
   const blocked = new Set();
+  // Cars always stop for shoppers on foot (and the carts they push).
+  const walkers = shopperBodies();
+  for (const [v, probe] of probes) {
+    if (walkers.some((b) => overlaps(probe, b))) blocked.add(v);
+  }
   for (const [v, list] of sees) {
     for (const o of list) {
       const mutual = (sees.get(o) || []).includes(v);
@@ -1431,8 +1501,9 @@ function updateTrafficCar(car, dt, blocked) {
       car.wait = 0;
     }
   } else if (car.mode === 'pullIn') {
-    state.parked.set(space.id, { color: car.color });
+    state.parked.set(space.id, { color: car.color, look: car.look, ownerInside: false });
     state.reserved.delete(space.id);
+    spawnShopperFromCar(space.id);
     car.gone = true;
   } else if (car.mode === 'backOut') {
     routeToExit(car, space);
@@ -1467,6 +1538,7 @@ function hitByCar(car) {
   state.timeLeft = Math.max(0, state.timeLeft - CONFIG.carHitTimePenalty);
   breakCombo();
   sfx.honk();
+  fxHonk(car);
   showMessage(`Hit by a car!  -${CONFIG.carHitTimePenalty}s${dropped.length ? `, dropped ${dropped.length}` : ''}`);
 }
 
@@ -1492,10 +1564,449 @@ function updateVehicles(dt) {
     spawnArrival();
     state.arriveTimer = randBetween(CONFIG.arriveEvery);
   }
-  state.departTimer -= dt;
-  if (state.departTimer <= 0) {
-    spawnDeparture();
-    state.departTimer = randBetween(CONFIG.departEvery);
+  // Cars whose shopper is back inside pull out as soon as traffic allows.
+  while (state.pendingDepart.length && state.traffic.length < CONFIG.trafficMaxMoving) {
+    spawnDeparture(state.pendingDepart.shift());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shoppers: people who get out of arriving cars and walk into the store, and
+// people who come back out pushing a cart, return it to the bin or abandon it
+// by their car, climb in and drive away. A shopper pushing a cart is solid:
+// the player and their train can't push through, and cars stop for them.
+// ---------------------------------------------------------------------------
+
+const SHOPPER_LOOK = {
+  skins: ['#ffe0c4', '#f5c7a1', '#e0a47a', '#c68a5e', '#8d5a3b', '#5e3a26'],
+  hairs: ['#2b1d16', '#5a3620', '#a0522d', '#d8b36a', '#e6e0d6', '#1a1a1a', '#b5422e'],
+  tops: ['#5b7fe0', '#ff8a70', '#7ed9b0', '#b99af0', '#ffe08a', '#f06c8a', '#7cc8f0', '#ff9f43'],
+  styles: ['short', 'bun', 'long', 'curly', 'bald', 'cap', 'headscarf', 'ponytail'],
+};
+let recentStyles = [];
+
+// A random shopper, avoiding the last few hair styles so a crowd stays varied.
+function makeLook() {
+  const pick = (list) => list[Math.floor(Math.random() * list.length)];
+  const styles = SHOPPER_LOOK.styles.filter((s) => !recentStyles.includes(s));
+  const style = pick(styles);
+  recentStyles = [...recentStyles, style].slice(-3);
+  return {
+    skin: pick(SHOPPER_LOOK.skins),
+    hair: pick(SHOPPER_LOOK.hairs),
+    top: pick(SHOPPER_LOOK.tops),
+    accent: pick(SHOPPER_LOOK.tops),
+    style,
+    glasses: Math.random() < 0.3,
+    tote: Math.random() < 0.45,
+    height: 0.9 + Math.random() * 0.22,
+    girth: 0.9 + Math.random() * 0.3,
+  };
+}
+
+const DOOR_POINT = { x: LOT.doors.x + LOT.doors.w / 2, y: 110 };
+// One drop-off in front of each bin lane, so returning shoppers don't queue on one spot.
+const BIN_MOUTHS = LOT.binLanes.map((lane) => ({ x: lane.x + CART_SIZE / 2, y: LOT.bin.y - 16 }));
+const HANDOFF_RADIUS = 24; // close enough to the bin or corral to hand a cart over
+const SHOPPER_PATIENCE = 8; // seconds stuck before a shopper gives up and leaves their cart
+
+function binMouthFor(from) {
+  const busy = (m) => state.shoppers.filter((o) => o.goal === m).length;
+  return [...BIN_MOUTHS].sort((a, b) => busy(a) - busy(b) || Math.hypot(a.x - from.x, a.y - from.y) - Math.hypot(b.x - from.x, b.y - from.y))[0];
+}
+const CORRAL_MOUTH = { x: LOT.returnZone.x + LOT.returnZone.w / 2, y: LOT.corral.y + LOT.corral.h + 14 };
+
+// Where a driver gets in or out: the open end of their space.
+function boardingPoint(space) {
+  const dir = space.pullAngle > 0 ? -1 : 1; // pulled in heading down -> the open end is up
+  return { x: space.center.x, y: space.center.y + dir * (SPACE_D / 2 + 6) };
+}
+
+function shopperBox(sh) {
+  const s = CONFIG.shopperSize;
+  return { x: sh.x - s / 2, y: sh.y - s / 2, w: s, h: s };
+}
+
+// Every shopper, and the cart any of them is pushing: what cars stop for.
+function shopperBodies() {
+  const out = [];
+  for (const sh of state.shoppers) {
+    out.push(shopperBox(sh));
+    if (sh.cartId) out.push(cartById(sh.cartId));
+  }
+  return out;
+}
+
+// Shoppers pushing carts: solid to the player (their carts are already solid
+// as carts).
+function cartPusherBoxes() {
+  return state.shoppers.filter((sh) => sh.cartId).map(shopperBox);
+}
+
+// ---- Walking routes: A* over a 10px grid around the lot's solids ----------
+
+const PED_CELL = 10;
+const PED_COLS = Math.ceil(W / PED_CELL);
+const PED_ROWS = Math.ceil(H / PED_CELL);
+const PED_PAD = 9; // keep this far from solids, so a pushed cart clears them too
+
+function markBlocked(grid, r, pad) {
+  const c0 = Math.max(0, Math.floor((r.x - pad) / PED_CELL));
+  const c1 = Math.min(PED_COLS - 1, Math.floor((r.x + r.w + pad) / PED_CELL));
+  const r0 = Math.max(0, Math.floor((r.y - pad) / PED_CELL));
+  const r1 = Math.min(PED_ROWS - 1, Math.floor((r.y + r.h + pad) / PED_CELL));
+  for (let row = r0; row <= r1; row++) for (let col = c0; col <= c1; col++) grid[row * PED_COLS + col] = 1;
+}
+
+const PED_STATIC = (() => {
+  const grid = new Uint8Array(PED_COLS * PED_ROWS);
+  for (const s of LOT.staticSolids) markBlocked(grid, s, PED_PAD);
+  // Walkers stay off the store wall and out of the bin and corral
+  markBlocked(grid, LOT.bin, 2);
+  markBlocked(grid, LOT.returnZone, 2);
+  return grid;
+})();
+
+function cellOf(pt) {
+  return {
+    c: Math.max(0, Math.min(PED_COLS - 1, Math.floor(pt.x / PED_CELL))),
+    r: Math.max(0, Math.min(PED_ROWS - 1, Math.floor(pt.y / PED_CELL))),
+  };
+}
+
+function nearestOpen(grid, cell) {
+  if (!grid[cell.r * PED_COLS + cell.c]) return cell;
+  for (let rad = 1; rad < 8; rad++) {
+    for (let dr = -rad; dr <= rad; dr++) {
+      for (let dc = -rad; dc <= rad; dc++) {
+        if (Math.max(Math.abs(dr), Math.abs(dc)) !== rad) continue;
+        const r = cell.r + dr;
+        const c = cell.c + dc;
+        if (r >= 0 && c >= 0 && r < PED_ROWS && c < PED_COLS && !grid[r * PED_COLS + c]) return { r, c };
+      }
+    }
+  }
+  return null;
+}
+
+function lineClear(grid, a, b) {
+  const d = Math.hypot(b.x - a.x, b.y - a.y);
+  const steps = Math.ceil(d / 4);
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const { r, c } = cellOf({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+    if (grid[r * PED_COLS + c]) return false;
+  }
+  return true;
+}
+
+// A walking route from `from` to `to` around parked cars and the lot's
+// solids, plus any `extra` boxes to avoid. Returns waypoints, or null.
+function planWalk(from, to, extra = []) {
+  const grid = PED_STATIC.slice();
+  for (const id of state.parked.keys()) markBlocked(grid, parkedBox(LOT.spaceById[id]), PED_PAD);
+  for (const b of extra) markBlocked(grid, b, PED_PAD);
+  const start = nearestOpen(grid, cellOf(from));
+  const goal = nearestOpen(grid, cellOf(to));
+  if (!start || !goal) return null;
+
+  const N = PED_COLS * PED_ROWS;
+  const g = new Float32Array(N).fill(Infinity);
+  const prev = new Int32Array(N).fill(-1);
+  const closed = new Uint8Array(N);
+  const heap = []; // [f, index]
+  const push = (f, i) => {
+    heap.push([f, i]);
+    let k = heap.length - 1;
+    while (k > 0) {
+      const p = (k - 1) >> 1;
+      if (heap[p][0] <= heap[k][0]) break;
+      [heap[p], heap[k]] = [heap[k], heap[p]];
+      k = p;
+    }
+  };
+  const pop = () => {
+    const top = heap[0];
+    const last = heap.pop();
+    if (heap.length) {
+      heap[0] = last;
+      let k = 0;
+      for (;;) {
+        const l = 2 * k + 1;
+        const r = l + 1;
+        let m = k;
+        if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
+        if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+        if (m === k) break;
+        [heap[m], heap[k]] = [heap[k], heap[m]];
+        k = m;
+      }
+    }
+    return top;
+  };
+  const h = (i) => {
+    const dc = Math.abs((i % PED_COLS) - goal.c);
+    const dr = Math.abs(Math.floor(i / PED_COLS) - goal.r);
+    return Math.max(dc, dr) + 0.41 * Math.min(dc, dr);
+  };
+  const si = start.r * PED_COLS + start.c;
+  const gi = goal.r * PED_COLS + goal.c;
+  g[si] = 0;
+  push(h(si), si);
+  while (heap.length) {
+    const [, i] = pop();
+    if (closed[i]) continue;
+    if (i === gi) break;
+    closed[i] = 1;
+    const c = i % PED_COLS;
+    const r = Math.floor(i / PED_COLS);
+    for (let dr = -1; dr <= 1; dr++) {
+      for (let dc = -1; dc <= 1; dc++) {
+        if (!dr && !dc) continue;
+        const nr = r + dr;
+        const nc = c + dc;
+        if (nr < 0 || nc < 0 || nr >= PED_ROWS || nc >= PED_COLS) continue;
+        const ni = nr * PED_COLS + nc;
+        if (grid[ni] || closed[ni]) continue;
+        // no cutting corners between two blocked cells
+        if (dr && dc && (grid[r * PED_COLS + nc] || grid[nr * PED_COLS + c])) continue;
+        const ng = g[i] + (dr && dc ? 1.414 : 1);
+        if (ng < g[ni]) {
+          g[ni] = ng;
+          prev[ni] = i;
+          push(ng + h(ni), ni);
+        }
+      }
+    }
+  }
+  if (g[gi] === Infinity) return null;
+
+  const cells = [];
+  for (let i = gi; i !== -1; i = prev[i]) {
+    cells.unshift({ x: (i % PED_COLS) * PED_CELL + PED_CELL / 2, y: Math.floor(i / PED_COLS) * PED_CELL + PED_CELL / 2 });
+  }
+  cells.push({ x: to.x, y: to.y });
+  // Straighten: skip waypoints while the line stays clear
+  const path = [cells[0]];
+  let k = 0;
+  while (k < cells.length - 1) {
+    let j = cells.length - 1;
+    while (j > k + 1 && !lineClear(grid, cells[k], cells[j])) j--;
+    path.push(cells[j]);
+    k = j;
+  }
+  return path;
+}
+
+// ---- Spawning ---------------------------------------------------------------
+
+function makeShopper(look, from, mode, extra = {}) {
+  const sh = {
+    id: state.nextShopperId++,
+    look,
+    x: from.x,
+    y: from.y,
+    fx: 0,
+    fy: 1,
+    mode, // 'toStore' | 'toBin' | 'toCorral' | 'toCar'
+    path: null,
+    idx: 1,
+    goal: null,
+    cartId: null,
+    space: null,
+    abandon: false,
+    wait: 0,
+    stuck: 0, // total seconds held up this leg
+    walked: 0, // distance, drives the waddle
+    moving: false,
+    ...extra,
+  };
+  state.shoppers.push(sh);
+  return sh;
+}
+
+function setGoal(sh, goal, extra = []) {
+  sh.goal = goal;
+  sh.path = planWalk({ x: sh.x, y: sh.y }, goal, extra);
+  sh.idx = 1;
+  sh.wait = 0;
+  if (!extra.length) sh.stuck = 0; // a fresh leg, not a detour
+  return !!sh.path;
+}
+
+// A driver who just parked walks into the store.
+function spawnShopperFromCar(spaceId) {
+  const entry = state.parked.get(spaceId);
+  const sh = makeShopper(entry.look, boardingPoint(LOT.spaceById[spaceId]), 'toStore', { space: spaceId });
+  if (!setGoal(sh, DOOR_POINT)) {
+    state.shoppers = state.shoppers.filter((s) => s !== sh);
+    entry.ownerInside = true;
+  }
+}
+
+// A shopper comes out of the store pushing a cart, heading for their car.
+function spawnShopperFromStore() {
+  if (state.shoppers.length >= CONFIG.maxShoppers || state.parked.size <= CONFIG.parkedMin) return;
+  const ready = [...state.parked.entries()].filter(([, e]) => e.ownerInside && !e.leaving);
+  if (!ready.length) return;
+  const [spaceId, entry] = ready[Math.floor(Math.random() * ready.length)];
+  // Don't pop a cart out on top of the player or another cart
+  const cartSpot = { x: DOOR_POINT.x - CART_SIZE / 2, y: DOOR_POINT.y + 17 - CART_SIZE / 2, w: CART_SIZE, h: CART_SIZE };
+  const busy = [state.player, ...state.carts, ...shopperBodies()].some((b) => overlaps(b, cartSpot) || overlaps(b, shopperBox(DOOR_POINT)));
+  if (busy) return;
+
+  const abandon = Math.random() < CONFIG.abandonChance;
+  const binFull = state.carts.filter((c) => c.status === 'inBin').length >= BIN_CAPACITY;
+  const sh = makeShopper(entry.look, { ...DOOR_POINT }, abandon ? 'toCar' : binFull ? 'toCorral' : 'toBin', { space: spaceId, abandon });
+  const cart = makeCart('standard', cartSpot.x, cartSpot.y, Math.PI / 2, 'shopper');
+  sh.cartId = cart.id;
+  const goal = sh.mode === 'toCar' ? boardingPoint(LOT.spaceById[spaceId]) : sh.mode === 'toBin' ? binMouthFor(sh) : CORRAL_MOUTH;
+  if (!setGoal(sh, goal)) {
+    state.shoppers = state.shoppers.filter((s) => s !== sh);
+    state.carts = state.carts.filter((c) => c !== cart);
+    return;
+  }
+  entry.ownerInside = false;
+  entry.leaving = true;
+}
+
+// ---- Walking ------------------------------------------------------------------
+
+// Where a shopper's cart sits: just ahead of them.
+function pushedCartAt(sh, x, y, fxd, fyd) {
+  const cx = x + fxd * 17;
+  const cy = y + fyd * 17;
+  return { x: cx - CART_SIZE / 2, y: cy - CART_SIZE / 2, w: CART_SIZE, h: CART_SIZE };
+}
+
+// Would this step walk the shopper (or their cart) into the player, the
+// train, a car or another shopper's cart?
+function shopperStepBlocked(sh, box, cartBox) {
+  // People on foot can squeeze past each other; only a pushed cart is in the way.
+  const hard = [state.player, ...trainCarts(), ...vehicleBoxes()];
+  for (const o of state.shoppers) {
+    if (o !== sh && o.cartId) hard.push(cartById(o.cartId));
+  }
+  const mine = [box, cartBox].filter(Boolean);
+  const before = [shopperBox(sh), sh.cartId ? cartById(sh.cartId) : null].filter(Boolean);
+  // Something we already overlap (say, a cart we spawned next to) doesn't hold us up.
+  return hard.some((o) => mine.some((m) => overlaps(m, o)) && !before.some((b) => overlaps(b, o)));
+}
+
+function finishLeg(sh) {
+  const entry = state.parked.get(sh.space);
+  const cart = sh.cartId ? cartById(sh.cartId) : null;
+  if (sh.mode === 'toStore') {
+    if (entry) entry.ownerInside = true;
+    sh.gone = true;
+    return;
+  }
+  if (sh.mode === 'toBin' || sh.mode === 'toCorral') {
+    // Cart returned: into the bin if there's room, otherwise it's put away at the corral.
+    state.carts = state.carts.filter((c) => c !== cart);
+    sh.cartId = null;
+    if (sh.mode === 'toBin') spawnCartInBin();
+    sh.mode = 'toCar';
+    if (!entry || !setGoal(sh, boardingPoint(LOT.spaceById[sh.space]))) sh.gone = true;
+    return;
+  }
+  if (sh.mode === 'toCar') {
+    if (cart) {
+      // Abandoned: left where it stands, a sad stray for the player
+      cart.status = 'loose';
+      cart.kind = 'stray';
+      sh.cartId = null;
+    }
+    sh.gone = true;
+    if (entry) state.pendingDepart.push(sh.space);
+  }
+}
+
+function updateShopper(sh, dt) {
+  sh.moving = false;
+  if (!sh.path) {
+    finishLeg(sh);
+    return;
+  }
+  const target = sh.path[sh.idx];
+  if (!target) {
+    finishLeg(sh);
+    return;
+  }
+  // Returning a cart: close enough to the bin or corral counts.
+  if ((sh.mode === 'toBin' || sh.mode === 'toCorral') && Math.hypot(sh.goal.x - sh.x, sh.goal.y - sh.y) < HANDOFF_RADIUS) {
+    finishLeg(sh);
+    return;
+  }
+  const dx = target.x - sh.x;
+  const dy = target.y - sh.y;
+  const d = Math.hypot(dx, dy);
+  if (d < 1.5) {
+    sh.idx += 1;
+    if (sh.idx >= sh.path.length) finishLeg(sh);
+    return;
+  }
+  const speed = sh.cartId ? CONFIG.shopperCartSpeed : CONFIG.shopperSpeed;
+  const step = Math.min(d, speed * dt);
+  const nx = sh.x + (dx / d) * step;
+  const ny = sh.y + (dy / d) * step;
+  // Turn smoothly toward the direction of travel, so a pushed cart swings round.
+  const k = Math.min(1, 7 * dt);
+  let fxd = sh.fx + (dx / d - sh.fx) * k;
+  let fyd = sh.fy + (dy / d - sh.fy) * k;
+  const fl = Math.hypot(fxd, fyd) || 1;
+  fxd /= fl;
+  fyd /= fl;
+  const cartBox = sh.cartId ? pushedCartAt(sh, nx, ny, fxd, fyd) : null;
+  if (shopperStepBlocked(sh, shopperBox({ x: nx, y: ny }), cartBox)) {
+    // Wait, then try walking around whatever's in the way.
+    sh.wait += dt;
+    sh.stuck += dt;
+    if (sh.stuck > SHOPPER_PATIENCE && sh.cartId) {
+      // Fed up: leave the cart right here and head for the car.
+      const cart = cartById(sh.cartId);
+      cart.status = 'loose';
+      cart.kind = 'stray';
+      sh.cartId = null;
+      sh.mode = 'toCar';
+      if (!setGoal(sh, boardingPoint(LOT.spaceById[sh.space]))) sh.gone = true;
+      return;
+    }
+    if (sh.stuck > SHOPPER_PATIENCE * 1.5) {
+      // Hopelessly boxed in on foot: count them as having made it.
+      finishLeg(sh);
+      return;
+    }
+    if (sh.wait > CONFIG.shopperReplanAfter) {
+      const around = [state.player, ...trainCarts(), ...vehicleBoxes()];
+      for (const o of state.shoppers) if (o !== sh && o.cartId) around.push(shopperBox(o), cartById(o.cartId));
+      if (!setGoal(sh, sh.goal, around)) sh.wait = 0;
+    }
+    return;
+  }
+  sh.wait = 0;
+  sh.x = nx;
+  sh.y = ny;
+  sh.fx = fxd;
+  sh.fy = fyd;
+  sh.walked += step;
+  sh.moving = true;
+  if (cartBox) {
+    const cart = cartById(sh.cartId);
+    cart.x = cartBox.x;
+    cart.y = cartBox.y;
+    cart.angle = Math.atan2(fyd, fxd);
+  }
+}
+
+function updateShoppers(dt) {
+  for (const sh of state.shoppers) updateShopper(sh, dt);
+  state.shoppers = state.shoppers.filter((sh) => !sh.gone);
+
+  state.shopperTimer -= dt;
+  if (state.shopperTimer <= 0) {
+    spawnShopperFromStore();
+    state.shopperTimer = randBetween(CONFIG.shopperExitEvery);
   }
 }
 
@@ -1583,6 +2094,7 @@ function update(dt) {
   state.goFlash = Math.max(0, state.goFlash - dt);
   updatePlayer(dt);
   updateVehicles(dt);
+  updateShoppers(dt);
   updateBin(dt);
   updateStrays(dt);
   updateShift(dt);
@@ -1622,28 +2134,57 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
+// The look: a clay diorama under a fixed high 3/4 camera. Every prop sits
+// on its real collision footprint and is extruded upward as a chunky block,
+// with a soft ground shadow, a darker side face and a thin warm outline.
+// Things further up the lot are drawn a touch smaller for a shallow fake
+// perspective; footprints (and so collisions) never move.
+
+const FONT = '"ui-rounded", "SF Pro Rounded", "Arial Rounded MT Bold", "Nunito", system-ui, sans-serif';
+const MONO = 'ui-monospace, "SF Mono", Menlo, "Courier New", monospace';
+
 const COLORS = {
-  asphalt: '#3a3d42',
-  sidewalk: '#9a978f',
-  storeWall: '#b5563f',
-  storeRoof: '#7d3a2a',
-  doors: '#9fd3e6',
-  paint: '#e8e6df',
-  fireLane: '#c9423a',
-  corralFloor: '#e3b43c',
-  binFloor: '#56595e',
-  rail: '#2b2b2b',
-  island: '#4f7d3b',
-  curb: '#c8c4b8',
-  lamp: '#1e1e1e',
-  accessible: '#2f6fb3',
-  gate: '#ffd23f',
-  cart: '#c9ced6',
-  cartOutline: '#4a4f57',
-  cartHandle: '#d8342c',
-  strayTag: '#ffd23f',
-  player: '#ff8a1f',
-  playerOutline: '#1a1a1a',
+  grass: '#9ee0bf',
+  grassDark: '#74c9a0',
+  asphalt: '#6f7b8b',
+  asphaltEdge: '#5a6573',
+  line: '#f7e7a6',
+  sidewalk: '#ece3d3',
+  sidewalkLine: '#d9cdb7',
+  curbRed: '#e2574c',
+  wall: '#fff4dc',
+  wallShade: '#f2e2c2',
+  roof: '#d8c29a',
+  awning: '#e8513f',
+  awningStripe: '#fff4dc',
+  glass: '#a9def2',
+  mint: '#8fdcb8',
+  mintSide: '#5fb892',
+  leaf: '#4fb884',
+  yellow: '#ffc93c',
+  yellowSide: '#dea21f',
+  cartTop: '#cfe0f2',
+  cartSide: '#8fa9c6',
+  cartGrid: '#7d95b3',
+  cartHandle: '#e8513f',
+  wheel: '#2f3440',
+  outline: '#3b2b2b',
+  shadow: 'rgba(45, 35, 55, 0.24)',
+  vest: '#17a39c',
+  vestDark: '#0f7d77',
+  shirt: '#ffffff',
+  skin: '#ffd2ad',
+  hair: '#6b3f2a',
+  shoe: '#e8513f',
+  ink: '#3b2b2b',
+  cream: '#fff6e2',
+  creamDark: '#efdfbc',
+  tomato: '#e8513f',
+  tomatoDark: '#b83a2c',
+  teal: '#17a39c',
+  gold: '#ffc93c',
+  // Kept for the HUD, menus and debug overlay.
+  storeRoof: '#b83a2c',
   hudBg: 'rgba(0, 0, 0, 0.55)',
   hudText: '#f2f2f2',
   hudWarn: '#ff6b57',
@@ -1657,129 +2198,237 @@ function fillRect(r, color) {
   ctx.fillRect(r.x, r.y, r.w, r.h);
 }
 
-function drawStore() {
-  const { store, doors } = LOT;
-  fillRect(store, COLORS.storeWall);
-  fillRect({ x: 0, y: 0, w: W, h: 18 }, COLORS.storeRoof);
-
-  // Sign
-  ctx.fillStyle = '#f6efe0';
-  ctx.fillRect(W / 2 - 110, 26, 220, 34);
-  ctx.fillStyle = COLORS.storeRoof;
-  ctx.font = 'bold 22px system-ui, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText('GROCERY', W / 2, 44);
-
-  // Windows
-  ctx.fillStyle = 'rgba(159, 211, 230, 0.6)';
-  for (let x = 40; x < W - 40; x += 120) {
-    if (x + 80 > doors.x && x < doors.x + doors.w) continue;
-    if (x + 80 > W / 2 - 110 && x < W / 2 + 110) continue;
-    ctx.fillRect(x, 58, 80, 18);
-  }
-
-  // Automatic doors
-  fillRect(doors, COLORS.doors);
-  ctx.strokeStyle = COLORS.rail;
-  ctx.lineWidth = 2;
+// Rounded-rectangle path.
+function rrPath(x, y, w, h, r) {
+  const rad = Math.max(0, Math.min(r, w / 2, h / 2));
   ctx.beginPath();
-  ctx.moveTo(doors.x + doors.w / 2, doors.y);
-  ctx.lineTo(doors.x + doors.w / 2, doors.y + doors.h);
+  ctx.moveTo(x + rad, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rad);
+  ctx.arcTo(x + w, y + h, x, y + h, rad);
+  ctx.arcTo(x, y + h, x, y, rad);
+  ctx.arcTo(x, y, x + w, y, rad);
+  ctx.closePath();
+}
+
+function rr(x, y, w, h, r, fill, stroke, lineWidth = 2) {
+  rrPath(x, y, w, h, r);
+  if (fill) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+  if (stroke) {
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = lineWidth;
+    ctx.stroke();
+  }
+}
+
+function circle(x, y, r, fill, stroke, lineWidth = 2) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  if (fill) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+  if (stroke) {
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = lineWidth;
+    ctx.stroke();
+  }
+}
+
+// Mix a #rrggbb color toward black (amt < 0) or white (amt > 0).
+const shadeCache = new Map();
+function shade(hex, amt) {
+  const key = hex + amt;
+  if (shadeCache.has(key)) return shadeCache.get(key);
+  const n = parseInt(hex.slice(1), 16);
+  const target = amt < 0 ? 0 : 255;
+  const k = Math.abs(amt);
+  const ch = (v) => Math.round(v + (target - v) * k);
+  const out = `rgb(${ch((n >> 16) & 255)}, ${ch((n >> 8) & 255)}, ${ch(n & 255)})`;
+  shadeCache.set(key, out);
+  return out;
+}
+
+function groundShadow(x, y, rx, ry) {
+  ctx.beginPath();
+  ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+  ctx.fillStyle = COLORS.shadow;
+  ctx.fill();
+}
+
+// Shallow fake perspective: 0.92 at the storefront, 1.0 at the bottom edge.
+function depthScale(y) {
+  return 0.92 + 0.08 * Math.max(0, Math.min(1, (y - 100) / (H - 100)));
+}
+
+// A chunky block: `path` traces the footprint in a local frame centered on
+// (cx, cy) and rotated by `angle` (+x forward). The side is stacked slices,
+// the top is lighter, the silhouette gets the warm outline.
+function block(cx, cy, angle, height, side, top, path, s = 1) {
+  const slice = (dz, fill, outline) => {
+    ctx.save();
+    ctx.translate(cx, cy - dz * s);
+    ctx.rotate(angle);
+    ctx.scale(s, s);
+    path();
+    ctx.fillStyle = fill;
+    ctx.fill();
+    if (outline) {
+      ctx.strokeStyle = COLORS.outline;
+      ctx.lineWidth = 2 / s;
+      ctx.lineJoin = 'round';
+      ctx.stroke();
+    }
+    ctx.restore();
+  };
+  slice(0, side, true);
+  for (let dz = 2; dz < height; dz += 2) slice(dz, side, false);
+  slice(height, top, true);
+}
+
+// Run `fn` in a local frame at (cx, cy - lift), rotated and scaled.
+function inFrame(cx, cy, angle, s, lift, fn) {
+  ctx.save();
+  ctx.translate(cx, cy - lift * s);
+  ctx.rotate(angle);
+  ctx.scale(s, s);
+  fn();
+  ctx.restore();
+}
+
+// ---- Ground ------------------------------------------------------------
+
+// Asphalt speckle, placed once so it doesn't shimmer.
+const SPECKS = (() => {
+  let seed = 7;
+  const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  return Array.from({ length: 260 }, () => ({ x: rand() * W, y: 162 + rand() * (H - 164), r: 0.8 + rand() * 1.6, light: rand() > 0.5 }));
+})();
+
+function wobblyLine(x1, y1, x2, y2, seed) {
+  const len = Math.hypot(x2 - x1, y2 - y1);
+  const steps = Math.max(2, Math.round(len / 8));
+  const nx = -(y2 - y1) / len;
+  const ny = (x2 - x1) / len;
+  ctx.beginPath();
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const wob = Math.sin(t * 9 + seed * 1.7) * 0.9;
+    const x = x1 + (x2 - x1) * t + nx * wob;
+    const y = y1 + (y2 - y1) * t + ny * wob;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
   ctx.stroke();
 }
 
-function drawSidewalk() {
-  fillRect(LOT.sidewalk, COLORS.sidewalk);
-  // Red fire-lane curb along the lot edge
-  fillRect({ x: 0, y: LOT.sidewalk.y + LOT.sidewalk.h - 4, w: W, h: 4 }, COLORS.fireLane);
-}
+function drawGround() {
+  // Mint lawn around the lot
+  fillRect({ x: 0, y: 0, w: W, h: H }, COLORS.grass);
 
-function drawCorral() {
-  const { corral, corralRails, returnZone } = LOT;
-
-  // Hatched floor
-  fillRect(returnZone, COLORS.corralFloor);
-  ctx.save();
-  ctx.beginPath();
-  ctx.rect(returnZone.x, returnZone.y, returnZone.w, returnZone.h);
-  ctx.clip();
-  ctx.strokeStyle = 'rgba(0, 0, 0, 0.18)';
-  ctx.lineWidth = 6;
-  for (let x = returnZone.x - returnZone.h; x < returnZone.x + returnZone.w; x += 16) {
+  // Sidewalk with tiles and the red fire-lane curb
+  rr(0, 90, W, 76, 10, COLORS.sidewalk);
+  ctx.strokeStyle = COLORS.sidewalkLine;
+  ctx.lineWidth = 1.5;
+  for (let x = 24; x < W; x += 48) {
     ctx.beginPath();
-    ctx.moveTo(x, returnZone.y + returnZone.h);
-    ctx.lineTo(x + returnZone.h, returnZone.y);
+    ctx.moveTo(x, 98);
+    ctx.lineTo(x, 154);
+    ctx.stroke();
+  }
+  ctx.beginPath();
+  ctx.moveTo(0, 127);
+  ctx.lineTo(W, 127);
+  ctx.stroke();
+
+  // Warm asphalt slab with rounded corners and a soft rim
+  rr(0, 156, W, H - 156 + 12, 26, COLORS.asphaltEdge);
+  rr(3, 159, W - 6, H - 159 + 8, 24, COLORS.asphalt);
+  for (const s of SPECKS) circle(s.x, s.y, s.r, s.light ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)');
+  rr(0, 154, W, 7, 3.5, COLORS.curbRed, COLORS.outline, 1.5);
+
+  // Welcome mat at the doors
+  rr(LOT.doors.x + 6, 100, LOT.doors.w - 12, 20, 6, '#7a8f6a', COLORS.outline, 1.5);
+
+  // Parking rows: thick, slightly wobbly cream lines
+  ctx.strokeStyle = COLORS.line;
+  ctx.lineWidth = 4;
+  ctx.lineCap = 'round';
+  for (const row of LOT.rows) {
+    for (let i = 0; i <= ROW_COUNT; i++) {
+      const x = ROW_X0 + i * SPACE_W;
+      wobblyLine(x, row.y + 4, x, row.y + SPACE_D - 4, i + row.y);
+    }
+    const endY = row.open === 'up' ? row.y + SPACE_D - 2 : row.y + 2;
+    wobblyLine(ROW_X0, endY, ROW_X0 + LOT.rowW, endY, row.y);
+  }
+  ctx.lineCap = 'butt';
+
+  // Accessible spaces
+  for (const id of LOT.accessibleSpaces) {
+    const s = LOT.spaceById[id];
+    rr(s.rect.x + 6, s.rect.y + 7, SPACE_W - 12, SPACE_D - 14, 8, '#5b8fe0');
+    circle(s.center.x, s.center.y, 9, '#ffffff');
+    circle(s.center.x, s.center.y, 4, '#5b8fe0');
+  }
+
+  drawAisleArrows();
+  drawGates();
+
+  // Bin floor and corral floor
+  const bin = LOT.bin;
+  rr(bin.x + 2, bin.y + 2, bin.w - 4, bin.h - 4, 8, '#5d6878');
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 5]);
+  ctx.beginPath();
+  ctx.moveTo(bin.x + bin.w / 2, bin.y + 6);
+  ctx.lineTo(bin.x + bin.w / 2, bin.y + bin.h - 8);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  const z = LOT.returnZone;
+  rr(z.x - 2, z.y - 2, z.w + 4, z.h + 6, 8, '#ffe6a0');
+  ctx.save();
+  rrPath(z.x - 2, z.y - 2, z.w + 4, z.h + 6, 8);
+  ctx.clip();
+  ctx.strokeStyle = 'rgba(222, 162, 31, 0.35)';
+  ctx.lineWidth = 7;
+  for (let x = z.x - z.h; x < z.x + z.w + 10; x += 18) {
+    ctx.beginPath();
+    ctx.moveTo(x, z.y + z.h + 6);
+    ctx.lineTo(x + z.h + 6, z.y - 2);
     ctx.stroke();
   }
   ctx.restore();
-
-  for (const r of corralRails) fillRect(r, COLORS.rail);
-
-  ctx.fillStyle = '#1a1a1a';
-  ctx.font = 'bold 13px system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(160, 105, 10, 0.75)';
+  ctx.font = `800 13px ${FONT}`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  const cx = corral.x + corral.w / 2;
-  ctx.fillText('CART CORRAL', cx, returnZone.y + 16);
-  ctx.fillText('RETURN ZONE', cx, returnZone.y + 34);
-}
-
-function drawBin() {
-  const { bin, binRails } = LOT;
-  fillRect(bin, COLORS.binFloor);
-  // Lane divider paint
-  ctx.strokeStyle = 'rgba(232, 230, 223, 0.5)';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(bin.x + bin.w / 2, bin.y + 4);
-  ctx.lineTo(bin.x + bin.w / 2, bin.y + bin.h - RAIL);
-  ctx.stroke();
-  for (const r of binRails) fillRect(r, COLORS.rail);
-}
-
-function drawRow(row) {
-  const { rowW } = LOT;
-  ctx.strokeStyle = COLORS.paint;
-  ctx.lineWidth = 2;
-
-  for (let i = 0; i <= ROW_COUNT; i++) {
-    const x = ROW_X0 + i * SPACE_W;
-    ctx.beginPath();
-    ctx.moveTo(x, row.y);
-    ctx.lineTo(x, row.y + SPACE_D);
-    ctx.stroke();
-  }
-  // Closed end of each space, opposite the side cars pull in from
-  const endY = row.open === 'up' ? row.y + SPACE_D : row.y;
-  ctx.beginPath();
-  ctx.moveTo(ROW_X0, endY);
-  ctx.lineTo(ROW_X0 + rowW, endY);
-  ctx.stroke();
-
-  for (const id of LOT.accessibleSpaces) {
-    const s = LOT.spaceById[id];
-    if (s.row !== row.id) continue;
-    ctx.fillStyle = COLORS.accessible;
-    ctx.fillRect(s.rect.x + 3, s.rect.y + 3, SPACE_W - 6, SPACE_D - 6);
-    ctx.fillStyle = COLORS.paint;
-    ctx.beginPath();
-    ctx.arc(s.center.x, s.center.y, 9, 0, Math.PI * 2);
-    ctx.fill();
-  }
+  ctx.fillText('CART CORRAL', z.x + z.w / 2, z.y + 18);
+  ctx.font = `800 10px ${FONT}`;
+  ctx.fillText('RETURN ZONE', z.x + z.w / 2, z.y + 34);
 }
 
 function drawAisleArrows() {
-  ctx.fillStyle = 'rgba(232, 230, 223, 0.55)';
+  ctx.fillStyle = 'rgba(247, 231, 166, 0.6)';
   const arrow = (x, y, angle) => {
     ctx.save();
     ctx.translate(x, y);
     ctx.rotate(angle);
+    rrPath(-12, -4, 14, 8, 4);
+    ctx.fill();
     ctx.beginPath();
     ctx.moveTo(14, 0);
-    ctx.lineTo(-8, -8);
-    ctx.lineTo(-8, 8);
+    ctx.lineTo(0, -10);
+    ctx.lineTo(0, 10);
     ctx.closePath();
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = 'rgba(247, 231, 166, 0.6)';
+    ctx.stroke();
     ctx.fill();
     ctx.restore();
   };
@@ -1796,157 +2445,704 @@ function drawAisleArrows() {
   arrow(932, 440, Math.PI / 2);
 }
 
-// Entrances: painted yellow stripes at the lot edge.
+// Entrances: rounded yellow IN / OUT tags at the lot edge.
 function drawGates() {
-  ctx.fillStyle = COLORS.gate;
-  ctx.font = 'bold 10px system-ui, sans-serif';
+  ctx.font = `800 10px ${FONT}`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  // Each entrance: a stripe across both lanes, IN and OUT labels on each.
+  const tag = (x, y, text) => {
+    rr(x - 16, y - 8, 32, 16, 8, COLORS.yellow, COLORS.outline, 1.5);
+    ctx.fillStyle = COLORS.ink;
+    ctx.fillText(text, x, y + 0.5);
+  };
   for (const g of GATES) {
     const inPt = LANE_NODES[g.in];
     const outPt = LANE_NODES[g.out];
-    const [lo, hi] = g.span;
     if (g.side === 'bottom') {
-      ctx.fillRect(lo - 22, H - 4, hi - lo + 44, 4);
-      ctx.fillText('IN', inPt.x, H - 12);
-      ctx.fillText('OUT', outPt.x, H - 12);
+      tag(inPt.x, H - 12, 'IN');
+      tag(outPt.x, H - 12, 'OUT');
     } else {
-      const x = g.side === 'left' ? 0 : W - 4;
-      ctx.fillRect(x, lo - 22, 4, hi - lo + 44);
-      const tx = g.side === 'left' ? 16 : W - 16;
-      ctx.fillText('IN', tx, inPt.y);
-      ctx.fillText('OUT', tx, outPt.y);
+      const x = g.side === 'left' ? 18 : W - 18;
+      tag(x, inPt.y, 'IN');
+      tag(x, outPt.y, 'OUT');
     }
   }
 }
 
-function drawIslandsAndLamps() {
-  for (const isl of LOT.islands) {
-    fillRect(isl, COLORS.curb);
-    fillRect({ x: isl.x + 3, y: isl.y + 3, w: isl.w - 6, h: isl.h - 6 }, COLORS.island);
+// ---- Storefront -----------------------------------------------------------
+
+function drawStore() {
+  const { doors } = LOT;
+  // Cream wall with a roof cap
+  fillRect({ x: 0, y: 0, w: W, h: 96 }, COLORS.wall);
+  fillRect({ x: 0, y: 0, w: W, h: 10 }, COLORS.roof);
+  fillRect({ x: 0, y: 86, w: W, h: 10 }, COLORS.wallShade);
+
+  // Big windows with produce stacked inside
+  const produce = ['#e8513f', '#ffb13c', '#7cc85a', '#ffd84a', '#e8513f', '#b36ad8'];
+  for (const [x0, x1] of [[20, 214], [346, 382], [708, 940]]) {
+    rr(x0, 50, x1 - x0, 34, 8, COLORS.glass, COLORS.outline, 2);
+    for (let x = x0 + 9, i = 0; x < x1 - 6; x += 11, i++) circle(x, 78, 5, produce[i % produce.length]);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+    ctx.fillRect(x0 + 8, 54, 6, 18);
   }
-  for (const lamp of LOT.lampPosts) {
-    ctx.fillStyle = 'rgba(255, 240, 180, 0.12)';
+
+  // Striped awning with a scalloped edge
+  const ay = 38, ah = 14;
+  for (let x = 0, i = 0; x < W; x += 24, i++) {
+    ctx.fillStyle = i % 2 ? COLORS.awningStripe : COLORS.awning;
+    ctx.fillRect(x, ay, 24, ah);
     ctx.beginPath();
-    ctx.arc(lamp.x + lamp.w / 2, lamp.y + lamp.h / 2, 40, 0, Math.PI * 2);
+    ctx.arc(x + 12, ay + ah, 12, 0, Math.PI);
     ctx.fill();
-    fillRect(lamp, COLORS.lamp);
   }
-}
-
-// Car drawn in its own frame: +x is the nose.
-function drawVehicle(cx, cy, angle, color, lights) {
-  const L = CONFIG.carLength / 2;
-  const Wd = CONFIG.carWidth / 2;
-  ctx.save();
-  ctx.translate(cx, cy);
-  ctx.rotate(angle);
-  ctx.fillStyle = color;
-  ctx.fillRect(-L, -Wd, L * 2, Wd * 2);
-  ctx.strokeStyle = 'rgba(0, 0, 0, 0.45)';
-  ctx.lineWidth = 1.5;
-  ctx.strokeRect(-L, -Wd, L * 2, Wd * 2);
-  ctx.fillStyle = 'rgba(20, 30, 45, 0.75)';
-  ctx.fillRect(L - 22, -Wd + 4, 11, Wd * 2 - 8); // windshield
-  ctx.fillRect(-L + 6, -Wd + 5, 8, Wd * 2 - 10); // rear window
-  if (lights) {
-    ctx.fillStyle = '#fff6b0';
-    ctx.fillRect(L - 3, -Wd + 2, 3, 6);
-    ctx.fillRect(L - 3, Wd - 8, 3, 6);
-  }
-  ctx.restore();
-}
-
-function drawParkedCars() {
-  for (const [id, car] of state.parked) {
-    const s = LOT.spaceById[id];
-    drawVehicle(s.center.x, s.center.y, s.pullAngle, car.color, false);
-  }
-}
-
-function drawMovingCars() {
-  for (const car of state.traffic) {
-    drawVehicle(car.cx, car.cy, car.angle, car.color, true);
-    // Reverse lights while backing out
-    if (car.reverse) {
-      ctx.save();
-      ctx.translate(car.cx, car.cy);
-      ctx.rotate(car.angle);
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(-CONFIG.carLength / 2, -CONFIG.carWidth / 2 + 2, 3, 6);
-      ctx.fillRect(-CONFIG.carLength / 2, CONFIG.carWidth / 2 - 8, 3, 6);
-      ctx.restore();
-    }
-  }
-}
-
-// Cart drawn in its own frame: +x points from the handle toward the basket nose.
-function drawCart(cart) {
-  const c = center(cart);
-  const half = cart.w / 2;
-  ctx.save();
-  ctx.translate(c.x, c.y);
-  ctx.rotate(cart.angle);
-  ctx.fillStyle = COLORS.cart;
-  ctx.strokeStyle = COLORS.cartOutline;
-  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = COLORS.outline;
+  ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.moveTo(-half + 3, -half + 1);
-  ctx.lineTo(half, -half + 3);
-  ctx.lineTo(half, half - 3);
-  ctx.lineTo(-half + 3, half - 1);
-  ctx.closePath();
-  ctx.fill();
+  ctx.moveTo(0, ay);
+  ctx.lineTo(W, ay);
   ctx.stroke();
-  // Basket grid
-  ctx.strokeStyle = 'rgba(74, 79, 87, 0.5)';
-  ctx.lineWidth = 1;
-  for (let i = -half + 8; i < half; i += 5) {
+
+  // Big automatic glass doors, framed
+  rr(doors.x - 6, 26, doors.w + 12, 72, 12, '#f7f2e6', COLORS.outline, 2.5);
+  rr(doors.x, 34, doors.w, 62, 8, COLORS.glass, COLORS.outline, 2);
+  ctx.strokeStyle = COLORS.outline;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(doors.x + doors.w / 2, 34);
+  ctx.lineTo(doors.x + doors.w / 2, 96);
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
+  ctx.beginPath();
+  ctx.moveTo(doors.x + 8, 90);
+  ctx.lineTo(doors.x + 22, 40);
+  ctx.lineTo(doors.x + 30, 40);
+  ctx.lineTo(doors.x + 16, 90);
+  ctx.fill();
+
+  // GROCERY sign
+  rr(W / 2 - 100, 4, 200, 40, 20, COLORS.tomato, COLORS.outline, 3);
+  ctx.fillStyle = COLORS.cream;
+  ctx.font = `900 24px ${FONT}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('GROCERY', W / 2, 25);
+
+  // "Please return your carts" board with a smiling cart
+  const bx = 594, by = 2, bw = 100, bh = 34;
+  rr(bx, by, bw, bh, 8, COLORS.cream, COLORS.outline, 2);
+  drawCartIcon(bx + 14, by + 18, 0.7, true);
+  ctx.fillStyle = COLORS.ink;
+  ctx.font = `800 7px ${FONT}`;
+  ctx.textAlign = 'left';
+  ctx.fillText('PLEASE RETURN', bx + 29, by + 13);
+  ctx.fillText('YOUR CARTS :)', bx + 29, by + 24);
+}
+
+// A flat little cart icon for signs and the UI.
+function drawCartIcon(x, y, s, smile) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(s, s);
+  rr(-12, -9, 20, 13, 4, COLORS.cartTop, COLORS.outline, 2);
+  ctx.strokeStyle = COLORS.cartHandle;
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(8, -9);
+  ctx.lineTo(12, -13);
+  ctx.stroke();
+  ctx.lineCap = 'butt';
+  circle(-7, 7, 3, COLORS.wheel);
+  circle(4, 7, 3, COLORS.wheel);
+  if (smile) {
+    circle(-6, -4, 1.4, COLORS.ink);
+    circle(1, -4, 1.4, COLORS.ink);
+    ctx.strokeStyle = COLORS.ink;
+    ctx.lineWidth = 1.4;
     ctx.beginPath();
-    ctx.moveTo(i, -half + 3);
-    ctx.lineTo(i, half - 3);
+    ctx.arc(-2.5, -2, 3, 0.2, Math.PI - 0.2);
     ctx.stroke();
   }
-  // Handle
-  ctx.fillStyle = COLORS.cartHandle;
-  ctx.fillRect(-half, -half, 3, cart.h);
-  // Strays wear a yellow tag: worth double
-  if (cart.kind === 'stray') {
-    ctx.fillStyle = COLORS.strayTag;
-    ctx.beginPath();
-    ctx.arc(2, 0, 4, 0, Math.PI * 2);
+  ctx.restore();
+}
+
+// ---- Props ---------------------------------------------------------------
+
+// Rounded-box footprint path for a local frame.
+const boxPath = (w, h, r) => () => rrPath(-w / 2, -h / 2, w, h, r);
+
+function drawCarProp(cx, cy, angle, color, opts = {}) {
+  const s = depthScale(cy);
+  const L = CONFIG.carLength;
+  const Wd = CONFIG.carWidth;
+  // Shadow: the rotated body, flattened and nudged down-right
+  inFrame(cx + 3, cy + 4, angle, s, 0, () => {
+    rrPath(-L / 2, -Wd / 2, L, Wd, 12);
+    ctx.fillStyle = COLORS.shadow;
     ctx.fill();
+  });
+  // Wheels peeking out at the corners
+  inFrame(cx, cy, angle, s, 0, () => {
+    for (const [wx, wy] of [[-16, -Wd / 2], [16, -Wd / 2], [-16, Wd / 2 - 5], [16, Wd / 2 - 5]]) {
+      rr(wx - 6, wy, 12, 5, 2.5, COLORS.wheel);
+    }
+  });
+  // Body, then the cabin on top
+  block(cx, cy - 2 * s, angle, 9, shade(color, -0.25), color, boxPath(L - 2, Wd - 2, 12), s);
+  block(cx, cy - 11 * s, angle, 7, shade(color, -0.12), shade(color, 0.3), boxPath(24, Wd - 10, 8), s);
+  inFrame(cx, cy, angle, s, 18, () => {
+    rr(3, -Wd / 2 + 7, 8, Wd - 14, 3, COLORS.glass); // windshield
+    rr(-12, -Wd / 2 + 8, 5, Wd - 16, 2, COLORS.glass); // rear window
+  });
+  // Headlights, and white reverse lights when backing out
+  inFrame(cx, cy, angle, s, 11, () => {
+    circle(L / 2 - 4, -Wd / 2 + 6, 3, opts.lights ? '#fff8c4' : '#f4ecd0', COLORS.outline, 1);
+    circle(L / 2 - 4, Wd / 2 - 6, 3, opts.lights ? '#fff8c4' : '#f4ecd0', COLORS.outline, 1);
+    if (opts.reverse) {
+      circle(-L / 2 + 4, -Wd / 2 + 6, 3, '#ffffff', COLORS.outline, 1);
+      circle(-L / 2 + 4, Wd / 2 - 6, 3, '#ffffff', COLORS.outline, 1);
+    }
+  });
+}
+
+// The hero prop. Local frame: +x is the nose (latch tongue), -x the red handle.
+function drawCartProp(cx, cy, angle, kind, opts = {}) {
+  const s = depthScale(cy) * (opts.scale || 1);
+  const lift = opts.lift || 0;
+  ctx.save();
+  if (opts.alpha !== undefined) ctx.globalAlpha = opts.alpha;
+  // Squash and stretch around the ground point
+  if (opts.sx || opts.sy) {
+    ctx.translate(cx, cy);
+    ctx.scale(opts.sx || 1, opts.sy || 1);
+    ctx.translate(-cx, -cy);
+  }
+  groundShadow(cx + 1, cy + 4, 10 * s, 7 * s);
+  // Wheels
+  inFrame(cx, cy, angle, s, 0, () => {
+    for (const [wx, wy] of [[-7, -6.5], [3, -5.5], [-7, 6.5], [3, 5.5]]) circle(wx, wy, 2.6, COLORS.wheel);
+  });
+  // The basket is drawn shorter than the 20-unit collision box so that in a
+  // nested train (carts 16 apart) each basket stays separate and countable;
+  // the latch tongue at the nose tucks under the next cart's handle, so the
+  // train still reads as hooked together.
+  block(cx, cy - (3 + lift) * s, angle, 3, shade('#8fa9c6', -0.2), '#a9bdd4', () => rrPath(3, -3, 8, 6, 3), s);
+  // Basket: a rounded trapezoid, wider at the handle end
+  const basket = () => {
+    ctx.beginPath();
+    ctx.moveTo(-7, -8);
+    ctx.lineTo(3, -6.5);
+    ctx.quadraticCurveTo(5, -6.5, 5, -4.5);
+    ctx.lineTo(5, 4.5);
+    ctx.quadraticCurveTo(5, 6.5, 3, 6.5);
+    ctx.lineTo(-7, 8);
+    ctx.quadraticCurveTo(-9, 8, -9, 6);
+    ctx.lineTo(-9, -6);
+    ctx.quadraticCurveTo(-9, -8, -7, -8);
+    ctx.closePath();
+  };
+  block(cx, cy - (3 + lift) * s, angle, 8, COLORS.cartSide, COLORS.cartTop, basket, s);
+  inFrame(cx, cy, angle, s, 11 + lift, () => {
+    // Wire grid on the top
+    ctx.strokeStyle = COLORS.cartGrid;
+    ctx.lineWidth = 1.2;
+    for (const gx of [-4, 0, 3]) {
+      ctx.beginPath();
+      ctx.moveTo(gx, -5.5);
+      ctx.lineTo(gx, 5.5);
+      ctx.stroke();
+    }
+    // Red child seat and handle bar
+    rr(-8, -3.5, 4, 7, 2, COLORS.cartHandle);
+    rr(-12, -8, 3.5, 16, 1.75, COLORS.cartHandle, COLORS.outline, 1.5);
+    // Strays: a sad sticky note
+    if (kind === 'stray') {
+      ctx.rotate(-angle + 0.25);
+      rr(-4, -4.5, 8.5, 8.5, 1.5, '#ffe45c', COLORS.outline, 1);
+      circle(-1.6, -1.6, 0.8, COLORS.ink);
+      circle(1.9, -1.6, 0.8, COLORS.ink);
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = 0.9;
+      ctx.beginPath();
+      ctx.arc(0.2, 2.2, 1.8, Math.PI + 0.4, -0.4);
+      ctx.stroke();
+    }
+  });
+  ctx.restore();
+}
+
+function drawPlayerProp() {
+  const p = state.player;
+  const c = center(p);
+  const moving = fx.speed > 8;
+  const sprint = p.sprinting && moving;
+  const hitAge = CONFIG.hitInvuln - p.invuln;
+  const sitting = p.invuln > 0 && hitAge < 0.8;
+  drawAttendant({
+    x: c.x,
+    y: c.y + 4,
+    s: depthScale(c.y),
+    fxd: p.facingX,
+    fyd: p.facingY,
+    moving,
+    sprint,
+    step: fx.walk * (sprint ? 0.09 : 0.14),
+    pushing: p.train.length > 0,
+    sitting,
+    hitAge,
+    faded: p.invuln > 0 && !sitting && Math.floor(p.invuln * 10) % 2 === 0,
+  });
+}
+
+// The cart attendant, standing on (x, y), facing (fxd, fyd). Shared by the
+// player in the lot and the mascot on the title screen.
+function drawAttendant({ x, y, s, fxd, fyd, moving, sprint, step, pushing, sitting, hitAge, faded }) {
+  const px = -fyd; // perpendicular (to the facing's right)
+  const py = fxd;
+  const stride = moving ? (sprint ? 5 : 3) : 0;
+
+  ctx.save();
+  if (faded) ctx.globalAlpha = 0.55;
+  ctx.translate(x, y);
+  ctx.scale(s, s);
+
+  groundShadow(0, 4, 12, 6);
+
+  // Comedic sit-down: squashed, feet out front, a little bounce
+  let bounce = 0;
+  let squash = 1;
+  if (sitting) {
+    const k = Math.max(0, 1 - hitAge / 0.8);
+    bounce = Math.abs(Math.sin(hitAge * 16)) * 5 * k;
+    squash = 0.72;
+  }
+  const bob = moving ? Math.abs(Math.sin(step)) * 2 : Math.sin(fx.time * 3) * 1;
+  const lean = sprint ? 4 : moving ? 1 : 0;
+
+  // Sneakers
+  const foot = (side, phase) => {
+    const f = sitting ? 7 : Math.sin(step + phase) * stride;
+    const x = side * px * 4 + fxd * f;
+    const y = side * py * 4 + fyd * f * 0.6;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(Math.atan2(fyd, fxd));
+    rr(-3, -2.5, 8, 5, 2.5, COLORS.shoe, COLORS.outline, 1.5);
+    rr(-3, 1, 8, 1.6, 0.8, '#ffffff');
+    ctx.restore();
+  };
+  foot(1, 0);
+  foot(-1, Math.PI);
+
+  ctx.translate(fxd * lean, -bounce);
+  ctx.rotate(moving && !sitting ? Math.sin(step) * 0.12 : 0);
+  ctx.scale(1, squash);
+
+  // Body: white shirt under a teal vest with a reflective stripe
+  const by = -12 - bob;
+  rr(-8, by - 3, 16, 17, 7, COLORS.shirt, COLORS.outline, 2);
+  rr(-8, by, 16, 12, 5, COLORS.vest, COLORS.outline, 1.5);
+  ctx.fillStyle = COLORS.gold;
+  ctx.fillRect(-7, by + 5, 14, 2.5);
+  if (fyd > -0.4) {
+    // Name tag on the chest
+    rr(-2 + px * 3 + fxd * 2, by + 1, 6, 4, 1, '#ffffff', COLORS.outline, 0.8);
+  }
+
+  // Hands: both on the train's handle when pushing, swinging otherwise
+  for (const side of [1, -1]) {
+    let hx;
+    let hy;
+    if (pushing) {
+      hx = fxd * 10 + side * px * 5;
+      hy = by + 5 + fyd * 6 + side * py * 5;
+    } else {
+      const swing = moving ? Math.sin(step + (side > 0 ? Math.PI : 0)) * 3 : 0;
+      hx = side * px * 9 + fxd * swing;
+      hy = by + 6 + side * py * 5 + fyd * swing * 0.5;
+    }
+    circle(hx, hy, 3.2, COLORS.skin, COLORS.outline, 1.5);
+  }
+
+  // Big head; the face shows on the side it's looking toward
+  const hx = fxd * (1 + lean * 0.6);
+  const hy = by - 12 + fyd * 1.5;
+  circle(hx, hy, 11, COLORS.hair, COLORS.outline, 2);
+  if (fyd > -0.6) {
+    const fx0 = hx + fxd * 2.5;
+    const fy0 = hy + fyd * 2 + 1.5;
+    circle(fx0, fy0, 8.8, COLORS.skin);
+    // Eyes and blush toward the facing side
+    const ex = fx0 + fxd * 3;
+    const ey = fy0 + fyd * 1.5 - 1;
+    const spread = Math.abs(fyd) > 0.5 ? 3.5 : 2;
+    circle(ex + px * spread, ey + py * spread * 0.4, 1.6, COLORS.ink);
+    circle(ex - px * spread, ey - py * spread * 0.4, 1.6, COLORS.ink);
+    circle(ex + px * (spread + 2), ey + 3, 1.6, 'rgba(255, 120, 120, 0.45)');
+    circle(ex - px * (spread + 2), ey + 3, 1.6, 'rgba(255, 120, 120, 0.45)');
+  }
+  // Hair tuft on top
+  ctx.fillStyle = COLORS.hair;
+  ctx.beginPath();
+  ctx.arc(hx - 2, hy - 10, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Dizzy stars after a knockdown
+  if (sitting) {
+    for (let i = 0; i < 3; i++) {
+      const a = fx.time * 6 + (i * Math.PI * 2) / 3;
+      drawStar(hx + Math.cos(a) * 13, hy - 12 + Math.sin(a) * 4, 3, COLORS.gold);
+    }
   }
   ctx.restore();
 }
 
-function drawCarts() {
-  // Bin carts from the back of the lane forward so the front one is on top.
-  const free = state.carts.filter((c) => c.status !== 'train').sort((a, b) => b.y - a.y);
-  for (const cart of free) drawCart(cart);
-  // Train from the nose back so each cart nests over the one ahead of it.
-  const train = trainCarts();
-  for (let i = train.length - 1; i >= 0; i--) drawCart(train[i]);
+// A shopper: same chunky build as the attendant, but in their own clothes,
+// hair, skin tone and size, with glasses or a tote bag on some.
+function drawShopperProp(sh) {
+  const look = sh.look;
+  const s = depthScale(sh.y) * look.height;
+  const g = look.girth;
+  const fxd = sh.fx;
+  const fyd = sh.fy;
+  const px = -fyd;
+  const py = fxd;
+  const step = sh.walked * 0.17;
+  const moving = sh.moving;
+  const pushing = !!sh.cartId;
+
+  ctx.save();
+  ctx.translate(sh.x, sh.y + 3);
+  ctx.scale(s, s);
+  groundShadow(0, 3, 9 * g, 5);
+
+  // Shoes
+  for (const [side, phase] of [[1, 0], [-1, Math.PI]]) {
+    const f = moving ? Math.sin(step + phase) * 2.5 : 0;
+    const x = side * px * 3.2 + fxd * f;
+    const y = side * py * 3.2 + fyd * f * 0.6;
+    rr(x - 3, y - 2, 6, 4, 2, '#3b3340', COLORS.outline, 1.2);
+  }
+
+  const bob = moving ? Math.abs(Math.sin(step)) * 1.6 : Math.sin(fx.time * 2.5 + sh.id) * 0.8;
+  ctx.rotate(moving ? Math.sin(step) * 0.09 : 0);
+  const by = -11 - bob;
+
+  // Body with a collar in the accent color
+  rr(-6.5 * g, by - 2, 13 * g, 14, 6, look.top, COLORS.outline, 1.8);
+  rr(-3.5, by - 2, 7, 3, 1.5, look.accent);
+
+  // Tote bag on the far side when their hands are free
+  if (!pushing && look.tote) {
+    const bx = px * 8.5 * g;
+    const bys = by + 3 + py * 3;
+    ctx.strokeStyle = COLORS.outline;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.arc(bx, bys, 3, Math.PI, 0);
+    ctx.stroke();
+    rr(bx - 4, bys, 8, 8, 2, look.accent, COLORS.outline, 1.2);
+  }
+
+  // Hands: both on the cart handle when pushing, swinging otherwise
+  for (const side of [1, -1]) {
+    let hx;
+    let hy;
+    if (pushing) {
+      hx = fxd * 8 + side * px * 4.5;
+      hy = by + 5 + fyd * 5 + side * py * 4;
+    } else {
+      const swing = moving ? Math.sin(step + (side > 0 ? Math.PI : 0)) * 2.5 : 0;
+      hx = side * px * 7.5 * g + fxd * swing;
+      hy = by + 6 + side * py * 4 + fyd * swing * 0.5;
+    }
+    circle(hx, hy, 2.6, look.skin, COLORS.outline, 1.2);
+  }
+
+  // Head
+  const hx = fxd * 1.2;
+  const hy = by - 9 + fyd * 1.2;
+  const faceShows = fyd > -0.6;
+  const style = look.style;
+  // Hair behind the head
+  if (style === 'long') rr(hx - 9, hy - 5, 18, 16, 7, look.hair, COLORS.outline, 1.5);
+  if (style === 'ponytail') circle(hx - fxd * 8.5, hy - fyd * 3 + 3, 3.8, look.hair, COLORS.outline, 1.2);
+  if (style === 'bun') circle(hx, hy - 9, 4.2, look.hair, COLORS.outline, 1.2);
+  if (style === 'curly') {
+    for (let i = 0; i < 7; i++) {
+      const a = Math.PI + (i / 6) * Math.PI;
+      circle(hx + Math.cos(a) * 8, hy + Math.sin(a) * 7.5, 3.6, look.hair, COLORS.outline, 1);
+    }
+  }
+  // Head base: hair color from behind, scarf, or bare
+  const base = style === 'bald' ? look.skin : style === 'headscarf' ? look.accent : look.hair;
+  circle(hx, hy, style === 'headscarf' ? 9.5 : 8.5, base, COLORS.outline, 1.8);
+  if (faceShows) {
+    const fr = style === 'headscarf' ? 6.2 : style === 'bald' ? 0 : 7.2;
+    const fcx = hx + fxd * 2.2;
+    const fcy = hy + fyd * 1.6 + 1.8;
+    if (fr) circle(fcx, fcy, fr, look.skin);
+    const ex = fcx + fxd * 2.5;
+    const ey = fcy + fyd * 1.2 - 1;
+    const spread = Math.abs(fyd) > 0.5 ? 3 : 1.8;
+    circle(ex + px * spread, ey + py * spread * 0.4, 1.3, COLORS.ink);
+    circle(ex - px * spread, ey - py * spread * 0.4, 1.3, COLORS.ink);
+    if (look.glasses) {
+      ctx.strokeStyle = COLORS.ink;
+      ctx.lineWidth = 1;
+      circle(ex + px * spread, ey + py * spread * 0.4, 2.4, null, COLORS.ink, 1);
+      circle(ex - px * spread, ey - py * spread * 0.4, 2.4, null, COLORS.ink, 1);
+    } else {
+      circle(ex + px * (spread + 1.8), ey + 2.5, 1.3, 'rgba(255, 120, 120, 0.4)');
+      circle(ex - px * (spread + 1.8), ey + 2.5, 1.3, 'rgba(255, 120, 120, 0.4)');
+    }
+  }
+  if (style === 'bald') {
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(hx - 2, hy - 3, 4, Math.PI * 1.1, Math.PI * 1.5);
+    ctx.stroke();
+  }
+  if (style === 'cap') {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(hx, hy - 1, 9, Math.PI, 0);
+    ctx.closePath();
+    ctx.fillStyle = look.accent;
+    ctx.fill();
+    ctx.strokeStyle = COLORS.outline;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.ellipse(hx + fxd * 7, hy - 1 + fyd * 3, 5, 2.5, Math.atan2(fyd, fxd), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+  ctx.restore();
 }
 
-function drawPlayer() {
-  const p = state.player;
-  // Blink while invulnerable after a hit
-  if (p.invuln > 0 && Math.floor(p.invuln * 10) % 2 === 0) return;
-  ctx.fillStyle = COLORS.player;
-  ctx.strokeStyle = COLORS.playerOutline;
-  ctx.lineWidth = 2;
-  ctx.fillRect(p.x, p.y, p.w, p.h);
-  ctx.strokeRect(p.x, p.y, p.w, p.h);
-
-  // Facing indicator
-  const cx = p.x + p.w / 2;
-  const cy = p.y + p.h / 2;
-  ctx.fillStyle = COLORS.playerOutline;
+function drawStar(x, y, r, fill) {
   ctx.beginPath();
-  ctx.arc(cx + p.facingX * 6, cy + p.facingY * 6, 3, 0, Math.PI * 2);
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + (i * Math.PI) / 5;
+    const rad = i % 2 ? r * 0.45 : r;
+    ctx.lineTo(x + Math.cos(a) * rad, y + Math.sin(a) * rad);
+  }
+  ctx.closePath();
+  ctx.fillStyle = fill;
   ctx.fill();
+  ctx.strokeStyle = COLORS.outline;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+}
+
+// Yellow metal bars with white stripes, used by the bin and the corral.
+function drawRail(r, height, flash) {
+  const cx = r.x + r.w / 2;
+  const cy = r.y + r.h / 2;
+  const s = depthScale(r.y + r.h);
+  const top = flash ? '#ffffff' : COLORS.yellow;
+  block(cx, cy, 0, height, COLORS.yellowSide, top, () => rrPath(-r.w / 2, -r.h / 2, r.w, r.h, Math.min(r.w, r.h) / 2), s);
+  // White safety stripes on the top face
+  inFrame(cx, cy, 0, s, height, () => {
+    ctx.save();
+    rrPath(-r.w / 2, -r.h / 2, r.w, r.h, Math.min(r.w, r.h) / 2);
+    ctx.clip();
+    ctx.strokeStyle = flash ? COLORS.yellow : 'rgba(255, 255, 255, 0.9)';
+    ctx.lineWidth = 3;
+    const span = Math.max(r.w, r.h);
+    for (let d = -span; d < span; d += 10) {
+      ctx.beginPath();
+      ctx.moveTo(d - 6, -r.h / 2 - 6);
+      ctx.lineTo(d + 6, r.h / 2 + 6);
+      ctx.stroke();
+    }
+    ctx.restore();
+  });
+}
+
+function drawIslandProp(isl) {
+  const cx = isl.x + isl.w / 2;
+  const cy = isl.y + isl.h / 2;
+  const s = depthScale(isl.y + isl.h);
+  groundShadow(cx + 2, cy + 4, isl.w / 2 + 2, isl.h / 2 + 2);
+  block(cx, cy, 0, 8, COLORS.mintSide, COLORS.mint, () => rrPath(-isl.w / 2, -isl.h / 2, isl.w, isl.h, 12), s);
+  // Round shrubs
+  inFrame(cx, cy, 0, s, 8, () => {
+    for (let y = -isl.h / 2 + 14; y < isl.h / 2 - 6; y += 22) {
+      circle(-4, y, 8, COLORS.leaf, COLORS.outline, 1.5);
+      circle(5, y + 6, 6, shade('#4fb884', 0.15), COLORS.outline, 1.5);
+    }
+  });
+}
+
+function drawLampProp(lamp) {
+  const cx = lamp.x + lamp.w / 2;
+  const cy = lamp.y + lamp.h / 2;
+  const s = depthScale(cy);
+  groundShadow(cx + 3, cy + 3, 9 * s, 5 * s);
+  block(cx, cy, 0, 4, '#5a6270', '#7d8696', () => rrPath(-6, -6, 12, 12, 6), s);
+  inFrame(cx, cy, 0, s, 0, () => {
+    rr(-2.5, -46, 5, 44, 2.5, '#7d8696', COLORS.outline, 1.5);
+    circle(0, -50, 12, 'rgba(255, 244, 190, 0.35)');
+    circle(0, -50, 7, '#fff3bf', COLORS.outline, 2);
+  });
+}
+
+// Glow at the corral mouth when the player or the train's nose is close.
+function drawDockGlow() {
+  const p = state.player;
+  const mouth = { x: LOT.returnZone.x + LOT.returnZone.w / 2, y: LOT.corral.y + LOT.corral.h };
+  const pts = [center(p)];
+  if (p.train.length) pts.push(center(trainCarts()[p.train.length - 1]));
+  const d = Math.min(...pts.map((pt) => Math.hypot(pt.x - mouth.x, pt.y - mouth.y)));
+  if (d > 130) return;
+  const k = (1 - d / 130) * (0.6 + 0.4 * Math.sin(fx.time * 6));
+  const g = ctx.createRadialGradient(mouth.x, mouth.y, 5, mouth.x, mouth.y, 90);
+  g.addColorStop(0, `rgba(255, 236, 140, ${0.75 * k})`);
+  g.addColorStop(1, 'rgba(255, 236, 140, 0)');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.ellipse(mouth.x, mouth.y - 10, 95, 45, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// Everything with height, drawn back to front by where it touches the ground.
+function drawWorld() {
+  drawGround();
+  drawStore();
+  drawDockGlow();
+  drawPuffs();
+
+  const props = [];
+  const add = (key, fn) => props.push({ key, fn });
+
+  for (const [id, car] of state.parked) {
+    const sp = LOT.spaceById[id];
+    const b = parkedBox(sp);
+    add(b.y + b.h, () => drawCarProp(sp.center.x, sp.center.y, sp.pullAngle, car.color));
+  }
+  for (const car of state.traffic) {
+    const b = vehicleBox(car);
+    add(b.y + b.h, () => drawCarProp(car.cx, car.cy, car.angle, car.color, { lights: true, reverse: car.reverse }));
+  }
+  for (const cart of state.carts) {
+    add(cart.y + cart.h, () => drawCartProp(cart.x + cart.w / 2, cart.y + cart.h / 2, cart.angle, cart.kind, cartMotion(cart)));
+  }
+  // Docked carts settling into the corral: a small drop with overshoot, then fade
+  for (const g of fx.ghosts) {
+    const settle = easeOutBack(Math.min(1, g.t / 0.35));
+    const alpha = g.t < 0.35 ? 1 : Math.max(0, 1 - (g.t - 0.35) / 0.4);
+    add(g.y + 10, () => drawCartProp(g.x, g.y, g.angle, g.kind, { lift: 6 * (1 - settle), alpha }));
+  }
+  add(state.player.y + state.player.h, drawPlayerProp);
+  for (const sh of state.shoppers) add(sh.y + CONFIG.shopperSize / 2, () => drawShopperProp(sh));
+  for (const isl of LOT.islands) add(isl.y + isl.h, () => drawIslandProp(isl));
+  for (const lamp of LOT.lampPosts) add(lamp.y + lamp.h, () => drawLampProp(lamp));
+  const binFlash = fx.binFlash > 0 && Math.floor(fx.binFlash * 8) % 2 === 0;
+  for (const r of LOT.binRails) add(r.y + r.h, () => drawRail(r, 12, binFlash));
+  for (const r of LOT.corralRails) add(r.y + r.h, () => drawRail(r, 14, false));
+
+  props.sort((a, b) => a.key - b.key);
+  for (const prop of props) prop.fn();
+
+  drawHonks();
+  drawSticker();
+}
+
+// Overshoot easing for the dock settle and pop-ins.
+function easeOutBack(t) {
+  const c = 1.9;
+  return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2);
+}
+
+// Idle bob for carts standing still, and a squash-and-stretch pop right
+// after a cart is latched.
+function cartMotion(cart) {
+  const opts = {};
+  if (cart.status === 'loose' || cart.status === 'inBin') opts.lift = 1.2 + Math.sin(fx.time * 3 + cart.id * 1.7) * 1.2;
+  const t0 = fx.pops.get(cart.id);
+  if (t0 !== undefined) {
+    const age = fx.time - t0;
+    if (age > 0.35) {
+      fx.pops.delete(cart.id);
+    } else {
+      const k = 1 - age / 0.35;
+      const wob = Math.sin(age * 30) * 0.25 * k;
+      opts.sx = 1 + wob;
+      opts.sy = 1 - wob;
+    }
+  }
+  return opts;
+}
+
+// Dust puffs at ground level when a train docks. Small and low, drawn under
+// the carts so they never hide one.
+function drawPuffs() {
+  for (const p of fx.puffs) {
+    const k = p.t / p.life;
+    circle(p.x, p.y - k * 4, 4 + k * 9, `rgba(255, 248, 228, ${0.6 * (1 - k)})`);
+  }
+}
+
+// A rounded HONK bubble above the car that hit you.
+function drawHonks() {
+  for (const h of fx.honks) {
+    if (state.traffic.includes(h.car)) {
+      h.x = h.car.cx;
+      h.y = h.car.cy;
+    }
+    if (h.x === undefined) continue;
+    // Sit off to the side of the car away from the player, so the bubble
+    // never covers the knocked-down player or their carts.
+    if (h.side === undefined) h.side = center(state.player).x < h.x ? 1 : -1;
+    const pop = easeOutBack(Math.min(1, h.t / 0.2));
+    const alpha = h.t < 0.7 ? 1 : Math.max(0, 1 - (h.t - 0.7) / 0.3);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(h.x + h.side * 46, h.y - 40);
+    ctx.scale(pop, pop);
+    ctx.rotate(-0.08);
+    ctx.beginPath();
+    ctx.moveTo(-6, 12);
+    ctx.lineTo(2, 22);
+    ctx.lineTo(8, 12);
+    ctx.fillStyle = '#ffffff';
+    ctx.fill();
+    rr(-30, -14, 60, 28, 14, '#ffffff', COLORS.outline, 2.5);
+    ctx.fillStyle = COLORS.tomato;
+    ctx.font = `900 16px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('HONK!', 0, 1);
+    ctx.restore();
+  }
+}
+
+// A sticker slapped on the awning after a good dock ("NICE TRAIN!").
+function drawSticker() {
+  const st = fx.sticker;
+  if (!st) return;
+  const pop = easeOutBack(Math.min(1, st.t / 0.25));
+  const alpha = st.t < 1.2 ? 1 : Math.max(0, 1 - (st.t - 1.2) / 0.3);
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(W / 2 + 205, 70);
+  ctx.rotate(-0.12);
+  ctx.scale(pop, pop);
+  ctx.font = `900 20px ${FONT}`;
+  const w = ctx.measureText(st.text).width + 34;
+  rr(-w / 2 + 3, -18 + 4, w, 36, 18, 'rgba(59, 43, 43, 0.3)');
+  rr(-w / 2, -18, w, 36, 18, COLORS.gold, '#ffffff', 5);
+  rr(-w / 2, -18, w, 36, 18, null, COLORS.outline, 2);
+  ctx.fillStyle = COLORS.ink;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(st.text, 0, 1);
+  ctx.restore();
 }
 
 function formatTime(t) {
@@ -1954,143 +3150,447 @@ function formatTime(t) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
+// ---- UI kit: chunky rounded pills, cream panels, fat type, soft shadows ----
+
+function pill(x, y, w, h, fill = COLORS.cream, r = h / 2) {
+  rr(x, y + 4, w, h, r, 'rgba(59, 43, 43, 0.28)');
+  rr(x, y, w, h, r, fill, COLORS.outline, 2.5);
+}
+
+function text(str, x, y, size, color, align = 'left', weight = 900, font = FONT) {
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'middle';
+  ctx.fillText(str, x, y);
+}
+
+// Fat sticker lettering: a thick dark outline under a colored fill.
+function stickerText(str, x, y, size, fill, scale = 1, alpha = 1) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(x, y);
+  ctx.scale(scale, scale);
+  ctx.font = `900 ${size}px ${FONT}`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = COLORS.outline;
+  ctx.lineWidth = Math.max(4, size * 0.16);
+  ctx.strokeText(str, 0, size * 0.04);
+  ctx.fillStyle = fill;
+  ctx.fillText(str, 0, 0);
+  ctx.restore();
+}
+
+// Rounded meter: a cream track with a colored fill.
+function meter(x, y, w, h, frac, fill) {
+  rr(x, y, w, h, h / 2, COLORS.creamDark, COLORS.outline, 1.5);
+  if (frac > 0) rr(x + 2, y + 2, Math.max(h - 4, (w - 4) * frac), h - 4, (h - 4) / 2, fill);
+}
+
+// Red-and-cream scalloped awning strip.
+function awning(x, y, w, h = 18) {
+  ctx.save();
+  rrPath(x, y, w, h + 10, 10);
+  ctx.clip();
+  const stripe = 26;
+  for (let sx = x, i = 0; sx < x + w; sx += stripe, i++) {
+    ctx.fillStyle = i % 2 ? COLORS.awningStripe : COLORS.awning;
+    ctx.fillRect(sx, y, stripe, h);
+    ctx.beginPath();
+    ctx.arc(sx + stripe / 2, y + h, stripe / 2, 0, Math.PI);
+    ctx.fill();
+  }
+  ctx.restore();
+  ctx.strokeStyle = COLORS.outline;
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(x + 8, y);
+  ctx.lineTo(x + w - 8, y);
+  ctx.stroke();
+}
+
+// A cream panel with an awning across its top.
+function awningCard(x, y, w, h) {
+  rr(x, y + 6, w, h, 22, 'rgba(59, 43, 43, 0.3)');
+  rr(x, y, w, h, 22, COLORS.cream, COLORS.outline, 3);
+  awning(x + 3, y + 3, w - 6, 20);
+}
+
+function dim(alpha = 0.6) {
+  ctx.fillStyle = `rgba(40, 28, 40, ${alpha})`;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// ---- HUD ------------------------------------------------------------------
+
 function drawHud() {
   const p = state.player;
   const n = p.train.length;
 
-  // Score, train length (with its dock bonus) and shift clock, top left
-  ctx.fillStyle = COLORS.hudBg;
-  ctx.fillRect(12, 12, 360, 30);
-  ctx.font = 'bold 16px system-ui, sans-serif';
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'middle';
-  ctx.fillStyle = COLORS.hudText;
-  ctx.fillText(`SCORE ${state.score}`, 22, 27);
-  ctx.fillStyle = n >= CONFIG.maxTrain ? COLORS.hudGold : COLORS.hudText;
-  ctx.fillText(`TRAIN ${n}/${CONFIG.maxTrain}${n > 1 ? ` x${trainBonus(n)}` : ''}`, 142, 27);
-  ctx.fillStyle = state.timeLeft <= 30 ? COLORS.hudWarn : COLORS.hudText;
-  ctx.fillText(formatTime(state.timeLeft), 312, 27);
+  // Score
+  pill(12, 8, 112, 40, COLORS.cream, 16);
+  text('SCORE', 26, 20, 9, COLORS.tomatoDark);
+  text(String(state.score), 26, 36, 20, COLORS.ink);
 
-  // Combo, top right: multiplier and the window draining
-  const kx = W - 172, ky = 12, kw = 160, kh = 30;
-  ctx.fillStyle = COLORS.hudBg;
-  ctx.fillRect(kx, ky, kw, kh);
-  const live = state.combo.timer > 0;
-  ctx.fillStyle = live ? COLORS.hudGold : 'rgba(242, 242, 242, 0.5)';
-  ctx.fillText(`COMBO ${comboMult()}x`, kx + 10, ky + 15);
-  ctx.fillStyle = '#222';
-  ctx.fillRect(kx + 104, ky + 11, 46, 8);
-  if (live) {
-    ctx.fillStyle = COLORS.hudGold;
-    ctx.fillRect(kx + 104, ky + 11, 46 * (state.combo.timer / CONFIG.comboWindow), 8);
+  // Train: count, dock bonus, and a pip per cart
+  pill(130, 8, 150, 40, COLORS.cream, 16);
+  text(`TRAIN ${n}/${CONFIG.maxTrain}`, 144, 20, 9, COLORS.tomatoDark);
+  if (n > 1) {
+    rr(226, 12, 44, 16, 8, COLORS.gold, COLORS.outline, 1.5);
+    text(`x${trainBonus(n)}`, 248, 20.5, 10, COLORS.ink, 'center');
+  }
+  for (let i = 0; i < CONFIG.maxTrain; i++) {
+    rr(144 + i * 21, 29, 17, 11, 4, i < n ? COLORS.teal : COLORS.creamDark, COLORS.outline, 1.5);
   }
 
-  // Stamina bar, bottom left
-  const bx = 12, by = H - 40, bw = 200, bh = 28;
-  ctx.fillStyle = COLORS.hudBg;
-  ctx.fillRect(bx, by, bw, bh);
-  ctx.fillStyle = COLORS.hudText;
-  ctx.font = 'bold 11px system-ui, sans-serif';
-  ctx.fillText('STAMINA', bx + 8, by + bh / 2);
-  const barX = bx + 68, barY = by + 9, barW = bw - 78, barH = 10;
-  ctx.fillStyle = '#222';
-  ctx.fillRect(barX, barY, barW, barH);
-  ctx.fillStyle = p.exhausted ? COLORS.staminaLow : COLORS.stamina;
-  ctx.fillRect(barX, barY, barW * (p.stamina / CONFIG.staminaMax), barH);
+  // Shift clock
+  const warn = state.timeLeft <= 30;
+  pill(286, 8, 80, 40, warn ? '#ffe0d8' : COLORS.cream, 16);
+  circle(304, 28, 8, '#ffffff', COLORS.outline, 2);
+  ctx.strokeStyle = COLORS.outline;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(304, 28);
+  ctx.lineTo(304, 23);
+  ctx.moveTo(304, 28);
+  ctx.lineTo(308, 30);
+  ctx.stroke();
+  text(formatTime(state.timeLeft), 318, 29, 17, warn ? COLORS.tomato : COLORS.ink);
+
+  // Combo: multiplier and the window draining
+  const live = state.combo.timer > 0;
+  const kx = W - 172;
+  pill(kx, 8, 160, 40, live ? '#fff0c2' : COLORS.cream, 16);
+  text('COMBO', kx + 14, 20, 9, COLORS.tomatoDark);
+  text(`${comboMult()}x`, kx + 14, 36, 20, live ? COLORS.tomato : 'rgba(59, 43, 43, 0.45)');
+  meter(kx + 70, 22, 78, 13, live ? state.combo.timer / CONFIG.comboWindow : 0, COLORS.gold);
+
+  // Stamina: a lightning bolt and a rounded meter
+  const sy = H - 46;
+  pill(12, sy, 206, 34, COLORS.cream, 17);
+  ctx.fillStyle = p.exhausted ? COLORS.tomato : COLORS.gold;
+  ctx.strokeStyle = COLORS.outline;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(33, sy + 6);
+  ctx.lineTo(25, sy + 19);
+  ctx.lineTo(31, sy + 19);
+  ctx.lineTo(28, sy + 29);
+  ctx.lineTo(38, sy + 14);
+  ctx.lineTo(32, sy + 14);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  meter(46, sy + 10, 160, 14, p.stamina / CONFIG.staminaMax, p.exhausted ? COLORS.tomato : '#5fcf8a');
 
   // Keyboard controls, bottom right. Touch players have the on-screen pad instead.
   if (!state.touchUi) {
     const lines = [
-      'WASD / Arrows  move / steer',
-      'Shift  sprint',
-      'Space / E  grab / latch / dock',
-      'Q  drop last cart',
-      'Esc  pause    M  mute',
-      `R  restart    H  debug (${state.debug ? 'on' : 'off'})`,
+      ['WASD / Arrows', 'move / steer'],
+      ['Shift', 'sprint'],
+      ['Space / E', 'grab · latch · dock'],
+      ['Q', 'drop last cart'],
+      ['Esc  ·  M', 'pause · mute'],
+      ['R  ·  H', `restart · debug ${state.debug ? 'on' : 'off'}`],
     ];
-    const cw = 210, ch = 14 + lines.length * 16;
+    const cw = 222, ch = 14 + lines.length * 15;
     const cx = W - cw - 12, cy = H - ch - 12;
-    ctx.fillStyle = COLORS.hudBg;
-    ctx.fillRect(cx, cy, cw, ch);
-    ctx.fillStyle = COLORS.hudText;
-    ctx.font = '12px system-ui, sans-serif';
-    lines.forEach((line, i) => ctx.fillText(line, cx + 10, cy + 15 + i * 16));
+    rr(cx, cy + 4, cw, ch, 14, 'rgba(59, 43, 43, 0.25)');
+    rr(cx, cy, cw, ch, 14, 'rgba(255, 246, 226, 0.92)', COLORS.outline, 2);
+    lines.forEach(([k, v], i) => {
+      text(k, cx + 12, cy + 14 + i * 15, 11, COLORS.tomatoDark, 'left', 900);
+      text(v, cx + 104, cy + 14 + i * 15, 11, COLORS.ink, 'left', 700);
+    });
   }
 
   // Message toast, bottom center
   if (state.message) {
+    ctx.save();
     ctx.globalAlpha = Math.min(1, state.message.t / 0.3);
-    ctx.font = 'bold 14px system-ui, sans-serif';
-    const tw = ctx.measureText(state.message.text).width + 24;
-    ctx.fillStyle = COLORS.hudBg;
-    ctx.fillRect(W / 2 - tw / 2, H - 42, tw, 28);
-    ctx.fillStyle = COLORS.hudText;
-    ctx.textAlign = 'center';
-    ctx.fillText(state.message.text, W / 2, H - 28);
-    ctx.globalAlpha = 1;
+    ctx.font = `900 14px ${FONT}`;
+    const tw = ctx.measureText(state.message.text).width + 32;
+    pill(W / 2 - tw / 2, H - 46, tw, 30, COLORS.cream);
+    text(state.message.text, W / 2, H - 31, 14, COLORS.ink, 'center');
+    ctx.restore();
   }
 }
 
-function dim(alpha = 0.6) {
-  ctx.fillStyle = `rgba(0, 0, 0, ${alpha})`;
-  ctx.fillRect(0, 0, W, H);
+// Pause and mute: round cream buttons with drawn icons.
+function drawHudButtons() {
+  for (const b of hudButtons()) {
+    const cx = b.x + b.w / 2;
+    const cy = b.y + b.h / 2 + 4;
+    circle(cx, cy + 3, 17, 'rgba(59, 43, 43, 0.28)');
+    circle(cx, cy, 17, COLORS.cream, COLORS.outline, 2.5);
+    ctx.fillStyle = COLORS.ink;
+    ctx.strokeStyle = COLORS.ink;
+    ctx.lineWidth = 2.2;
+    ctx.lineCap = 'round';
+    if (b.icon === 'pause') {
+      rr(cx - 7, cy - 7, 5, 14, 2, COLORS.ink);
+      rr(cx + 2, cy - 7, 5, 14, 2, COLORS.ink);
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(cx - 10, cy - 3);
+      ctx.lineTo(cx - 6, cy - 3);
+      ctx.lineTo(cx - 1, cy - 8);
+      ctx.lineTo(cx - 1, cy + 8);
+      ctx.lineTo(cx - 6, cy + 3);
+      ctx.lineTo(cx - 10, cy + 3);
+      ctx.closePath();
+      ctx.fill();
+      ctx.beginPath();
+      if (b.icon === 'muted') {
+        ctx.moveTo(cx + 3, cy - 4);
+        ctx.lineTo(cx + 10, cy + 4);
+        ctx.moveTo(cx + 10, cy - 4);
+        ctx.lineTo(cx + 3, cy + 4);
+      } else {
+        ctx.arc(cx + 1, cy, 5, -Math.PI / 3, Math.PI / 3);
+        ctx.moveTo(cx + 1 + 9 * Math.cos(-Math.PI / 3), cy + 9 * Math.sin(-Math.PI / 3));
+        ctx.arc(cx + 1, cy, 9, -Math.PI / 3, Math.PI / 3);
+      }
+      ctx.stroke();
+    }
+    ctx.lineCap = 'butt';
+  }
 }
 
-function drawCard(x, y, w, h) {
-  ctx.fillStyle = '#f6efe0';
-  ctx.fillRect(x, y, w, h);
-  ctx.strokeStyle = COLORS.storeRoof;
-  ctx.lineWidth = 4;
-  ctx.strokeRect(x + 2, y + 2, w - 4, h - 4);
-}
+// ---- Menus ------------------------------------------------------------------
 
-// Menu buttons; the keyboard-selected one is filled gold.
-function drawMenuButtons(light) {
+// Chunky toy buttons: a colored cap on a darker lip. The keyboard-selected
+// one gets a gold ring and a gentle pulse.
+function drawMenuButtons() {
   menuButtons().forEach((b, i) => {
     const focused = i === state.menuFocus;
-    ctx.fillStyle = focused ? COLORS.hudGold : light ? '#e6ddc8' : 'rgba(0, 0, 0, 0.6)';
-    ctx.fillRect(b.x, b.y, b.w, b.h);
-    ctx.strokeStyle = focused ? '#7a5b00' : light ? COLORS.storeRoof : 'rgba(255, 255, 255, 0.6)';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2);
-    ctx.fillStyle = focused || light ? '#1a1a1a' : '#f2f2f2';
-    ctx.font = 'bold 18px system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+    const primary = b.action === 'play' || b.action === 'resume';
+    const cap = primary ? COLORS.tomato : COLORS.cream;
+    const lip = primary ? COLORS.tomatoDark : COLORS.creamDark;
+    const ink = primary ? COLORS.cream : COLORS.ink;
+    const s = focused ? 1 + Math.sin(fx.time * 5) * 0.02 : 1;
+    ctx.save();
+    ctx.translate(b.x + b.w / 2, b.y + b.h / 2);
+    ctx.scale(s, s);
+    const x = -b.w / 2, y = -b.h / 2;
+    const r = Math.min(20, b.h / 2);
+    if (focused) rr(x - 6, y - 6, b.w + 12, b.h + 14, r + 6, null, COLORS.gold, 5);
+    rr(x, y + 6, b.w, b.h, r, lip, COLORS.outline, 2.5);
+    rr(x, y, b.w, b.h, r, cap, COLORS.outline, 2.5);
+    rr(x + 10, y + 5, b.w - 20, 6, 3, 'rgba(255, 255, 255, 0.35)');
+    text(b.label, 0, 1, b.h > 48 ? 21 : 18, ink, 'center');
+    ctx.restore();
   });
 }
 
+// Title: a marquee sign hanging over a sunburst, the pitch on a ribbon, a
+// records sticker, and the attendant pushing a little train across the lot.
 function drawTitle() {
-  dim(0.62);
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillStyle = COLORS.hudGold;
-  ctx.font = 'bold 76px system-ui, sans-serif';
-  ctx.fillText('CART JOCKEY', W / 2, 150);
-  ctx.fillStyle = '#f2f2f2';
-  ctx.font = '19px system-ui, sans-serif';
-  ctx.fillText('Round up shopping carts into long trains and dock them before your shift ends.', W / 2, 214);
-  drawMenuButtons(false);
+  dim(0.3);
+  drawSunburst(W / 2, 120);
+  drawMarquee();
+  drawRibbon('Round up carts into long trains and dock them before your shift ends!', W / 2, 210);
+  drawMenuButtons();
+  drawRecordsBadge(812, 128);
+  drawParade();
+  const hint = state.touchUi ? 'Tap Play to start' : 'Arrow keys + Enter, or click  ·  M mutes';
+  ctx.font = `800 12px ${FONT}`;
+  const hw = ctx.measureText(hint).width + 28;
+  pill(W / 2 - hw / 2, 392, hw, 24, COLORS.cream);
+  text(hint, W / 2, 404, 12, COLORS.ink, 'center', 800);
+}
 
+// Slowly turning cream rays behind the sign.
+function drawSunburst(cx, cy) {
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(fx.time * 0.08);
+  const rays = 18;
+  for (let i = 0; i < rays; i++) {
+    if (i % 2) continue;
+    const a0 = (i / rays) * Math.PI * 2;
+    const a1 = ((i + 1) / rays) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.arc(0, 0, 820, a0, a1);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(255, 236, 170, 0.16)';
+    ctx.fill();
+  }
+  ctx.restore();
+  const g = ctx.createRadialGradient(cx, cy, 20, cx, cy, 330);
+  g.addColorStop(0, 'rgba(255, 244, 200, 0.45)');
+  g.addColorStop(1, 'rgba(255, 244, 200, 0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+}
+
+// The logo: a chunky tomato sign on chains, ringed with blinking bulbs,
+// "CART" and "JOCKEY" bouncing letter by letter.
+function drawMarquee() {
+  const x = 262, y = 30, w = 436, h = 146;
+  const swing = Math.sin(fx.time * 1.4) * 0.012;
+  ctx.save();
+  ctx.translate(W / 2, 0);
+  ctx.rotate(swing);
+  ctx.translate(-W / 2, 0);
+
+  // Chains up to the top of the screen
+  ctx.strokeStyle = COLORS.outline;
+  ctx.lineWidth = 3;
+  for (const cx of [x + 70, x + w - 70]) {
+    for (let cy = -6; cy < y; cy += 10) {
+      ctx.beginPath();
+      ctx.ellipse(cx, cy + 5, 3.5, 5.5, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  // Board: darker lip, tomato face, cream inner border
+  rr(x, y + 10, w, h, 34, COLORS.tomatoDark, COLORS.outline, 3);
+  rr(x, y, w, h, 34, COLORS.tomato, COLORS.outline, 3);
+  rr(x + 14, y + 14, w - 28, h - 28, 22, null, 'rgba(255, 246, 226, 0.85)', 3);
+  rr(x + 30, y + 6, w - 60, 8, 4, 'rgba(255, 255, 255, 0.28)');
+
+  // Bulbs around the edge, chasing
+  const bulbs = [];
+  for (let bx = x + 26; bx <= x + w - 26; bx += 29) {
+    bulbs.push([bx, y + 7], [bx, y + h - 7]);
+  }
+  for (let by = y + 36; by <= y + h - 36; by += 30) {
+    bulbs.push([x + 7, by], [x + w - 7, by]);
+  }
+  const chase = Math.floor(fx.time * 4);
+  bulbs.forEach(([bx, by], i) => {
+    const on = (i + chase) % 3 !== 0;
+    if (on) circle(bx, by, 8, 'rgba(255, 236, 140, 0.35)');
+    circle(bx, by, 4.5, on ? '#fff6c4' : '#e7b85a', COLORS.outline, 1.5);
+  });
+
+  // Letters, each bobbing a little out of step
+  const word = (str, cy, size, fill, spacing) => {
+    ctx.font = `900 ${size}px ${FONT}`;
+    const widths = [...str].map((ch) => ctx.measureText(ch).width + spacing);
+    const total = widths.reduce((a, b) => a + b, 0) - spacing;
+    let lx = W / 2 - total / 2;
+    [...str].forEach((ch, i) => {
+      const bob = Math.sin(fx.time * 3 + i * 0.7) * 3;
+      const tilt = Math.sin(fx.time * 2 + i) * 0.05;
+      ctx.save();
+      ctx.translate(lx + widths[i] / 2 - spacing / 2, cy + bob);
+      ctx.rotate(tilt);
+      stickerText(ch, 0, 0, size, fill);
+      ctx.restore();
+      lx += widths[i];
+    });
+  };
+  word('CART', y + 48, 46, COLORS.gold, 4);
+  word('JOCKEY', y + 104, 58, COLORS.cream, 3);
+
+  // A smiling cart peeking over the top corner of the sign
+  drawCartIcon(x + w - 44, y - 4 + Math.sin(fx.time * 3) * 2, 1.5, true);
+  ctx.restore();
+}
+
+// A cream ribbon banner with folded tails.
+function drawRibbon(str, cx, cy) {
+  ctx.font = `800 15px ${FONT}`;
+  const w = ctx.measureText(str).width + 60;
+  const h = 32;
+  const x = cx - w / 2;
+  const y = cy - h / 2;
+  for (const side of [-1, 1]) {
+    const ex = side < 0 ? x + 8 : x + w - 8;
+    ctx.beginPath();
+    ctx.moveTo(ex, y + 8);
+    ctx.lineTo(ex + side * 34, y + 8);
+    ctx.lineTo(ex + side * 22, y + h / 2 + 8);
+    ctx.lineTo(ex + side * 34, y + h + 8);
+    ctx.lineTo(ex, y + h + 8);
+    ctx.closePath();
+    ctx.fillStyle = COLORS.creamDark;
+    ctx.fill();
+    ctx.strokeStyle = COLORS.outline;
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+  }
+  rr(x, y + 4, w, h, 10, 'rgba(59, 43, 43, 0.25)');
+  rr(x, y, w, h, 10, COLORS.cream, COLORS.outline, 2.5);
+  text(str, cx, cy + 1, 15, COLORS.ink, 'center', 800);
+}
+
+// Gold starburst sticker with the saved records.
+function drawRecordsBadge(cx, cy) {
   const s = state.saved;
-  ctx.fillStyle = '#f2f2f2';
-  ctx.font = 'bold 16px system-ui, sans-serif';
-  ctx.fillText(`High score ${s.highScore}     Best combo ${CONFIG.comboMults[s.bestComboLevel]}x`, W / 2, 420);
-  ctx.fillStyle = 'rgba(242, 242, 242, 0.65)';
-  ctx.font = '13px system-ui, sans-serif';
-  ctx.fillText(state.touchUi ? 'Tap a button to start' : 'Arrow keys + Enter, or click  ·  M mutes', W / 2, 452);
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(0.14 + Math.sin(fx.time * 1.6) * 0.03);
+  const points = 16;
+  const star = (ro, ri) => {
+    ctx.beginPath();
+    for (let i = 0; i < points * 2; i++) {
+      const a = (i * Math.PI) / points;
+      const r = i % 2 ? ri : ro;
+      ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
+    }
+    ctx.closePath();
+  };
+  ctx.translate(3, 5);
+  star(66, 56);
+  ctx.fillStyle = 'rgba(59, 43, 43, 0.3)';
+  ctx.fill();
+  ctx.translate(-3, -5);
+  star(66, 56);
+  ctx.fillStyle = COLORS.gold;
+  ctx.fill();
+  ctx.strokeStyle = COLORS.outline;
+  ctx.lineWidth = 2.5;
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+  circle(0, 0, 48, null, 'rgba(255, 255, 255, 0.7)', 2);
+  text('HIGH SCORE', 0, -22, 10, COLORS.tomatoDark, 'center', 900);
+  stickerText(String(s.highScore), 0, 2, 28, COLORS.cream);
+  text(`BEST COMBO ${CONFIG.comboMults[s.bestComboLevel]}x`, 0, 28, 9, COLORS.ink, 'center', 900);
+  ctx.restore();
+}
+
+// The attendant happily pushing a three-cart train across the bottom of the
+// screen, looping forever.
+function drawParade() {
+  const k = 1.7;
+  const span = W + 260;
+  const baseX = ((fx.time * 48) % span) - 150;
+  const baseY = 470;
+  ctx.save();
+  ctx.translate(baseX, baseY);
+  ctx.scale(k, k);
+  const hop = Math.abs(Math.sin(fx.time * 6)) * 0.8;
+  for (let i = 2; i >= 0; i--) {
+    drawCartProp(21 + i * 16, 0, 0, i === 2 ? 'stray' : 'standard', { lift: hop });
+  }
+  drawAttendant({
+    x: 0,
+    y: 4,
+    s: 1,
+    fxd: 1,
+    fyd: 0,
+    moving: true,
+    sprint: false,
+    step: fx.time * 7,
+    pushing: true,
+    sitting: false,
+    hitAge: 1,
+    faded: false,
+  });
+  ctx.restore();
 }
 
 function drawHowTo() {
-  dim(0.7);
-  // Starts below the HUD icons so the mute button stays clear of the card.
-  drawCard(110, 52, W - 220, H - 88);
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillStyle = COLORS.storeRoof;
-  ctx.font = 'bold 26px system-ui, sans-serif';
-  ctx.fillText('HOW TO PLAY', W / 2, 86);
+  dim(0.5);
+  awningCard(110, 50, W - 220, H - 84);
+  stickerText('HOW TO PLAY', W / 2, 96, 30, COLORS.gold);
 
   const touch = state.touchUi;
   const grab = touch ? 'GRAB' : 'Space / E';
@@ -2101,137 +3601,156 @@ function drawHowTo() {
     'Longer trains are slower and turn wider, but pay more: each extra cart adds x0.5.',
     'Yellow-tagged strays, tucked between parked cars or on the curb, are worth double.',
     'Dock again within 12 seconds with freshly collected carts to climb the combo: 1.5x, 2x, 3x.',
-    `Cars come and go all shift. A hit drops your whole train and costs 5 seconds.`,
+    'Cars come and go all shift. A hit drops your whole train and costs 5 seconds.',
     `${touch ? 'DROP' : 'Q'} drops the last cart. ${touch ? 'The pause button' : 'Esc'} pauses. Grade is your score against par.`,
   ];
-  ctx.textAlign = 'left';
-  ctx.font = '15px system-ui, sans-serif';
+  const dots = [COLORS.tomato, COLORS.gold, COLORS.teal, '#5b7fe0', '#ff8a70', '#b99af0', '#7ed9b0', '#ffb38a'];
   lines.forEach((line, i) => {
-    const y = 128 + i * 35;
-    ctx.fillStyle = COLORS.storeRoof;
-    ctx.fillRect(146, y - 3, 6, 6);
-    ctx.fillStyle = '#2a2a2a';
-    ctx.fillText(line, 164, y);
+    const y = 136 + i * 35;
+    circle(150, y, 6, dots[i % dots.length], COLORS.outline, 1.5);
+    text(line, 166, y, 14.5, COLORS.ink, 'left', 700);
   });
-  drawMenuButtons(true);
+  drawMenuButtons();
 }
 
 function drawPaused() {
-  dim(0.6);
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillStyle = '#f2f2f2';
-  ctx.font = 'bold 40px system-ui, sans-serif';
-  ctx.fillText('PAUSED', W / 2, 150);
-  drawMenuButtons(false);
-  ctx.fillStyle = 'rgba(242, 242, 242, 0.65)';
-  ctx.font = '13px system-ui, sans-serif';
-  ctx.fillText(state.touchUi ? 'Tap Resume to keep going' : 'Esc to resume', W / 2, 420);
+  dim(0.45);
+  awningCard(300, 108, 360, 318);
+  stickerText('PAUSED', W / 2, 160, 38, COLORS.cream);
+  drawMenuButtons();
+  text(state.touchUi ? 'Tap Resume to keep going' : 'Esc to resume', W / 2, 410, 12, 'rgba(59, 43, 43, 0.6)', 'center', 700);
 }
 
+// The end screen, printed like a shift receipt.
 function drawTally() {
-  dim(0.6);
-  const pw = 400, ph = 456;
-  const px = (W - pw) / 2, py = 42;
-  drawCard(px, py, pw, ph);
+  dim(0.5);
+  const x = W / 2 - 150, y = 12, w = 300, h = 396;
+  const tooth = 8;
+  const paper = () => {
+    ctx.beginPath();
+    ctx.moveTo(x, y + tooth);
+    for (let tx = x; tx < x + w; tx += tooth * 2) {
+      ctx.lineTo(tx + tooth, y);
+      ctx.lineTo(Math.min(x + w, tx + tooth * 2), y + tooth);
+    }
+    ctx.lineTo(x + w, y + h - tooth);
+    for (let tx = x + w; tx > x; tx -= tooth * 2) {
+      ctx.lineTo(tx - tooth, y + h);
+      ctx.lineTo(Math.max(x, tx - tooth * 2), y + h - tooth);
+    }
+    ctx.closePath();
+  };
+  ctx.save();
+  ctx.translate(5, 7);
+  paper();
+  ctx.fillStyle = 'rgba(30, 20, 30, 0.35)';
+  ctx.fill();
+  ctx.restore();
+  paper();
+  ctx.fillStyle = '#fffdf6';
+  ctx.fill();
+  ctx.strokeStyle = COLORS.outline;
+  ctx.lineWidth = 2;
+  ctx.stroke();
 
-  ctx.fillStyle = COLORS.storeRoof;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.font = 'bold 26px system-ui, sans-serif';
-  ctx.fillText('SHIFT OVER', W / 2, py + 32);
+  const left = x + 22;
+  const right = x + w - 22;
+  const ink = '#2e2a2a';
+  drawCartIcon(W / 2, y + 30, 1.2, true);
+  text('CART JOCKEY MARKET', W / 2, y + 56, 15, ink, 'center', 800, MONO);
+  text('SHIFT RECEIPT', W / 2, y + 74, 11, ink, 'center', 500, MONO);
+  text(new Date().toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }), W / 2, y + 89, 10, '#6f6a66', 'center', 500, MONO);
+
+  const dashed = (yy) => {
+    ctx.strokeStyle = '#8f8a84';
+    ctx.lineWidth = 1.2;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(left, yy);
+    ctx.lineTo(right, yy);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  };
+  // "LABEL ........ VALUE"
+  const row = (label, value, yy, bold = false, flag = '') => {
+    const wt = bold ? 800 : 500;
+    text(label, left, yy, 12, ink, 'left', wt, MONO);
+    text(value, right, yy, 12, ink, 'right', wt, MONO);
+    ctx.font = `${wt} 12px ${MONO}`;
+    const lw = ctx.measureText(label).width;
+    const vw = ctx.measureText(value).width;
+    ctx.fillStyle = '#b5afa8';
+    for (let dx = left + lw + 6; dx < right - vw - 6; dx += 5) ctx.fillRect(dx, yy + 3, 1.5, 1.5);
+    if (flag) {
+      rr(right - vw - 44, yy - 7, 34, 14, 7, COLORS.tomato);
+      text(flag, right - vw - 27, yy + 0.5, 8, '#ffffff', 'center', 900);
+    }
+  };
 
   const s = state.saved;
-  const rows = [
-    ['Score', `${state.score} / ${CONFIG.parScore} par`],
-    ['Carts returned', String(state.docked)],
-    ['Best train', `${state.best.train} / ${CONFIG.maxTrain}`],
-    ['Best combo', `${CONFIG.comboMults[state.best.comboLevel]}x`, state.newRecord.combo],
-    ['High score', String(s.highScore), state.newRecord.score],
-  ];
-  rows.forEach(([label, value, isNew], i) => {
-    const y = py + 72 + i * 27;
-    ctx.fillStyle = '#3a3a3a';
-    ctx.textAlign = 'left';
-    ctx.font = '16px system-ui, sans-serif';
-    ctx.fillText(label, px + 34, y);
-    if (isNew) {
-      const labelW = ctx.measureText(label).width;
-      ctx.fillStyle = '#b3261e';
-      ctx.font = 'bold 11px system-ui, sans-serif';
-      ctx.fillText('NEW!', px + 34 + labelW + 10, y);
-    }
-    ctx.fillStyle = '#111';
-    ctx.textAlign = 'right';
-    ctx.font = 'bold 16px system-ui, sans-serif';
-    ctx.fillText(value, px + pw - 34, y);
-  });
+  dashed(y + 102);
+  row('CARTS RETURNED', String(state.docked), y + 120);
+  row('BEST TRAIN', `${state.best.train}/${CONFIG.maxTrain}`, y + 139);
+  row('BEST COMBO', `${CONFIG.comboMults[state.best.comboLevel]}x`, y + 158, false, state.newRecord.combo ? 'NEW' : '');
+  row('HIGH SCORE', String(s.highScore), y + 177, false, state.newRecord.score ? 'NEW' : '');
+  dashed(y + 193);
+  row('SCORE', String(state.score), y + 211, true);
+  row('PAR', String(CONFIG.parScore), y + 230);
+  row('PERCENT', `${scorePercent(state.score)}%`, y + 249);
+  dashed(y + 265);
 
-  // Grade: the letter, the percent of par behind it, and the scale
+  // Grade: a rubber stamp
   const grade = gradeFor(state.score);
-  const gy = py + 232;
-  ctx.textAlign = 'center';
-  ctx.fillStyle = '#3a3a3a';
-  ctx.font = '14px system-ui, sans-serif';
-  ctx.fillText('GRADE', W / 2 - 64, gy);
-  ctx.fillStyle = grade === 'F' ? '#b3261e' : COLORS.storeRoof;
-  ctx.font = 'bold 52px system-ui, sans-serif';
-  ctx.fillText(grade, W / 2, gy);
-  ctx.fillStyle = '#3a3a3a';
-  ctx.font = 'bold 16px system-ui, sans-serif';
-  ctx.fillText(`${scorePercent(state.score)}%`, W / 2 + 64, gy);
-
-  ctx.fillStyle = '#6b6b6b';
-  ctx.font = '12px system-ui, sans-serif';
-  const scale = CONFIG.grades.map((g) => (g.min > 0 ? `${g.grade} ${g.min}%+` : `${g.grade} below ${CONFIG.grades[CONFIG.grades.length - 2].min}%`));
-  ctx.fillText(scale.join('   '), W / 2, gy + 42);
-
-  if (state.newRecord.score) {
-    ctx.fillStyle = '#b3261e';
-    ctx.font = 'bold 18px system-ui, sans-serif';
-    ctx.fillText('NEW HIGH SCORE!', W / 2, gy + 80);
-  }
-
-  drawMenuButtons(true);
-  ctx.fillStyle = '#6b6b6b';
-  ctx.font = '12px system-ui, sans-serif';
-  ctx.textAlign = 'center';
-  ctx.fillText(state.touchUi ? '' : 'R plays again', W / 2, py + ph - 14);
-}
-
-// Big centered text with a drop shadow, scaled around its center.
-function bigText(text, y, size, color, scale = 1, alpha = 1) {
   ctx.save();
-  ctx.globalAlpha = alpha;
-  ctx.translate(W / 2, y);
-  ctx.scale(scale, scale);
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.font = `bold ${size}px system-ui, sans-serif`;
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
-  ctx.fillText(text, 4, 5);
-  ctx.fillStyle = color;
-  ctx.fillText(text, 0, 0);
+  ctx.translate(W / 2 + 70, y + 305);
+  ctx.rotate(-0.16);
+  const stamp = grade === 'F' ? '#c62f24' : grade === 'A' ? '#1f9a70' : '#d0622a';
+  ctx.globalAlpha = 0.9;
+  circle(0, 0, 30, null, stamp, 4);
+  circle(0, 0, 24, null, stamp, 1.5);
+  text(grade, 0, 2, 34, stamp, 'center', 900);
   ctx.restore();
+  text('GRADE', left, y + 294, 12, ink, 'left', 800, MONO);
+  const scale = CONFIG.grades.map((g) => (g.min > 0 ? `${g.grade}${g.min}+` : `${g.grade}<${CONFIG.grades[CONFIG.grades.length - 2].min}`)).join(' ');
+  text(scale, left, y + 312, 9, '#6f6a66', 'left', 500, MONO);
+  if (state.newRecord.score) text('** NEW HIGH SCORE **', left, y + 330, 10, COLORS.tomato, 'left', 800, MONO);
+
+  // Barcode and thanks
+  let bx = W / 2 - 60;
+  let seed = state.score + 17;
+  while (bx < W / 2 + 60) {
+    seed = (seed * 9301 + 49297) % 233280;
+    const bw = 1 + (seed % 3);
+    ctx.fillStyle = ink;
+    ctx.fillRect(bx, y + 346, bw, 22);
+    bx += bw + 1 + (seed % 2);
+  }
+  text('THANK YOU FOR RETURNING CARTS!', W / 2, y + 378, 9, ink, 'center', 700, MONO);
+
+  drawMenuButtons();
+  if (!state.touchUi) text('R plays again', W / 2, 482, 11, 'rgba(255, 246, 226, 0.8)', 'center', 700);
 }
+
+// ---- Countdown, GO!, final stretch ----------------------------------------
 
 // "3, 2, 1" before the shift: each number pops in large and settles.
 function drawCountdown() {
-  dim(0.35);
+  dim(0.25);
   const n = Math.max(1, Math.ceil(state.countdown));
   const into = n - state.countdown; // 0 when the number appears, 1 when it's replaced
   const pop = 1 + 0.5 * Math.max(0, 1 - into / 0.25);
-  bigText('GET READY', 170, 30, '#f2f2f2');
-  bigText(String(n), 290, 150, COLORS.hudGold, pop);
+  pill(W / 2 - 90, 150, 180, 40, COLORS.cream);
+  text('GET READY', W / 2, 171, 20, COLORS.ink, 'center');
+  stickerText(String(n), W / 2, 300, 150, COLORS.gold, pop);
 }
 
 // GO! right after the countdown, growing and fading out.
 function drawGo() {
   const t = state.goFlash / 0.8; // 1 -> 0
-  bigText('GO!', 280, 130, '#5fd068', 1 + (1 - t) * 0.4, Math.min(1, t * 1.5));
+  stickerText('GO!', W / 2, 280, 130, '#6fdc9a', 1 + (1 - t) * 0.4, Math.min(1, t * 1.5));
 }
 
-// The final stretch: a big red clock over the store sign that thumps on
+// The final stretch: a big tomato clock over the store sign that thumps on
 // every second, with a red glow around the edge of the lot. The last five
 // seconds thump harder.
 function drawFinalClock() {
@@ -2241,70 +3760,23 @@ function drawFinalClock() {
   const beat = Math.max(0, (frac - 0.7) / 0.3); // 1 right as a new second starts
   const scale = 1 + (urgent ? 0.35 : 0.18) * beat;
 
-  // Edge glow
   const glow = (urgent ? 0.55 : 0.3) * (0.4 + 0.6 * beat);
   ctx.save();
-  ctx.strokeStyle = `rgba(230, 40, 30, ${glow})`;
+  ctx.strokeStyle = `rgba(232, 60, 45, ${glow})`;
   ctx.lineWidth = urgent ? 16 : 10;
-  ctx.strokeRect(0, 0, W, H);
+  rrPath(0, 0, W, H, 18);
+  ctx.stroke();
   ctx.restore();
 
-  // Clock badge
-  const bw = 170, bh = 64;
+  const bw = 170, bh = 62;
   ctx.save();
   ctx.translate(W / 2, 8 + bh / 2);
   ctx.scale(scale, scale);
-  ctx.fillStyle = urgent ? '#c81e14' : '#a3231a';
-  ctx.fillRect(-bw / 2, -bh / 2, bw, bh);
-  ctx.strokeStyle = '#ffd23f';
-  ctx.lineWidth = 3;
-  ctx.strokeRect(-bw / 2 + 1.5, -bh / 2 + 1.5, bw - 3, bh - 3);
-  ctx.fillStyle = '#ffffff';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.font = 'bold 44px ui-monospace, Menlo, monospace';
-  ctx.fillText(formatTime(t), 0, 2);
+  rr(-bw / 2, -bh / 2 + 6, bw, bh, 26, COLORS.tomatoDark, COLORS.outline, 3);
+  rr(-bw / 2, -bh / 2, bw, bh, 26, urgent ? '#f0402f' : COLORS.tomato, COLORS.outline, 3);
+  rr(-bw / 2 + 14, -bh / 2 + 6, bw - 28, 7, 3.5, 'rgba(255, 255, 255, 0.3)');
+  stickerText(formatTime(t), 0, 2, 40, COLORS.cream);
   ctx.restore();
-}
-
-// Pause and mute icons, drawn as shapes.
-function drawHudButtons() {
-  for (const b of hudButtons()) {
-    ctx.fillStyle = COLORS.hudBg;
-    ctx.fillRect(b.x, b.y, b.w, b.h);
-    ctx.fillStyle = COLORS.hudText;
-    ctx.strokeStyle = COLORS.hudText;
-    ctx.lineWidth = 2;
-    const cx = b.x + b.w / 2;
-    const cy = b.y + b.h / 2;
-    if (b.icon === 'pause') {
-      ctx.fillRect(cx - 7, cy - 8, 5, 16);
-      ctx.fillRect(cx + 2, cy - 8, 5, 16);
-      continue;
-    }
-    // Speaker
-    ctx.beginPath();
-    ctx.moveTo(cx - 11, cy - 4);
-    ctx.lineTo(cx - 6, cy - 4);
-    ctx.lineTo(cx, cy - 9);
-    ctx.lineTo(cx, cy + 9);
-    ctx.lineTo(cx - 6, cy + 4);
-    ctx.lineTo(cx - 11, cy + 4);
-    ctx.closePath();
-    ctx.fill();
-    ctx.beginPath();
-    if (b.icon === 'muted') {
-      ctx.moveTo(cx + 4, cy - 5);
-      ctx.lineTo(cx + 12, cy + 5);
-      ctx.moveTo(cx + 12, cy - 5);
-      ctx.lineTo(cx + 4, cy + 5);
-    } else {
-      ctx.arc(cx + 2, cy, 6, -Math.PI / 3, Math.PI / 3);
-      ctx.moveTo(cx + 2 + 10 * Math.cos(-Math.PI / 3), cy + 10 * Math.sin(-Math.PI / 3));
-      ctx.arc(cx + 2, cy, 10, -Math.PI / 3, Math.PI / 3);
-    }
-    ctx.stroke();
-  }
 }
 
 function drawDebug() {
@@ -2346,6 +3818,21 @@ function drawDebug() {
     pts.forEach((pt, i) => (i ? ctx.lineTo(pt.x, pt.y) : ctx.moveTo(pt.x, pt.y)));
     ctx.stroke();
     ctx.setLineDash([]);
+  }
+
+  // Shoppers: box (solid when pushing a cart) and the rest of their walk
+  for (const sh of state.shoppers) {
+    const b = shopperBox(sh);
+    ctx.strokeStyle = sh.cartId ? '#b6ff3b' : 'rgba(182, 255, 59, 0.5)';
+    ctx.strokeRect(b.x + 0.5, b.y + 0.5, b.w - 1, b.h - 1);
+    if (sh.path) {
+      ctx.setLineDash([2, 4]);
+      ctx.beginPath();
+      ctx.moveTo(sh.x, sh.y);
+      for (const pt of sh.path.slice(sh.idx)) ctx.lineTo(pt.x, pt.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
   }
 
   const p = state.player;
@@ -2401,23 +3888,38 @@ function drawDebug() {
     lx, 116,
   );
   ctx.fillText(`combo ${state.combo.timer.toFixed(1)}s  fresh ${state.freshPickup}  invuln ${p.invuln.toFixed(1)}`, lx, 134);
-  ctx.fillText(`parked ${state.parked.size}  moving ${state.traffic.length}  arrive ${state.arriveTimer.toFixed(1)}  leave ${state.departTimer.toFixed(1)}`, lx, 152);
+  ctx.fillText(`parked ${state.parked.size}  moving ${state.traffic.length}  shoppers ${state.shoppers.length}  arrive ${state.arriveTimer.toFixed(1)}`, lx, 152);
+}
+
+// Advance presentation-only animation clocks (frozen while paused).
+function tickFx() {
+  const now = performance.now();
+  const dt = fx.lastNow ? Math.min(0.05, (now - fx.lastNow) / 1000) : 0;
+  fx.lastNow = now;
+  if (state.phase === 'paused') return;
+  fx.time += dt;
+  for (const list of [fx.ghosts, fx.puffs, fx.honks]) for (const e of list) e.t += dt;
+  fx.ghosts = fx.ghosts.filter((g) => g.t < 0.75);
+  fx.puffs = fx.puffs.filter((p) => p.t < p.life);
+  fx.honks = fx.honks.filter((h) => h.t < 1);
+  if (fx.sticker) {
+    fx.sticker.t += dt;
+    if (fx.sticker.t > 1.5) fx.sticker = null;
+  }
+  fx.binFlash = Math.max(0, fx.binFlash - dt);
+  const p = state.player;
+  const pos = { x: p.x, y: p.y };
+  const moved = fx.lastPos ? Math.hypot(pos.x - fx.lastPos.x, pos.y - fx.lastPos.y) : 0;
+  fx.lastPos = pos;
+  if (moved < 40) {
+    fx.walk += moved;
+    fx.speed = dt > 0 ? fx.speed * 0.7 + (moved / dt) * 0.3 : fx.speed;
+  }
 }
 
 function draw() {
-  fillRect({ x: 0, y: 0, w: W, h: H }, COLORS.asphalt);
-  drawSidewalk();
-  drawStore();
-  drawCorral();
-  drawAisleArrows();
-  drawGates();
-  for (const row of LOT.rows) drawRow(row);
-  drawParkedCars();
-  drawBin();
-  drawIslandsAndLamps();
-  drawCarts();
-  drawPlayer();
-  drawMovingCars();
+  tickFx();
+  drawWorld();
   if (state.debug) drawDebug();
 
   const phase = state.phase;
@@ -2461,4 +3963,5 @@ window.lotRunner = {
   state, LOT, CONFIG, held, setHeld, pressAction, resetSession,
   spawnStray, spawnArrival, spawnDeparture, findRoute, trainBonus, gradeFor, scorePercent,
   inputLog, sfx, menuButtons, hudButtons, persist, STORE_KEY,
+  spawnShopperFromStore, planWalk, makeLook,
 };

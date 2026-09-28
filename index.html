@@ -14,9 +14,18 @@
   <div id="touch" aria-hidden="true">
     <div id="stick" class="stick"><div class="knob"></div></div>
     <div class="pad">
-      <button type="button" class="tbtn" data-hold="sprint">SPRINT</button>
-      <button type="button" class="tbtn big" data-press="interact">GRAB<br>DOCK</button>
-      <button type="button" class="tbtn" data-press="dropLast">DROP</button>
+      <button type="button" class="tbtn sprint" data-hold="sprint">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13.5 2 5 13.5h6L9.5 22 19 9.5h-6L13.5 2z"/></svg>
+        <span>SPRINT</span>
+      </button>
+      <button type="button" class="tbtn big grab" data-press="interact">
+        <svg viewBox="0 0 32 24" aria-hidden="true"><path d="M3 4h4l1 3h19l-3 9H10z"/><circle cx="12" cy="20" r="2.4"/><circle cx="23" cy="20" r="2.4"/></svg>
+        <span>GRAB · DOCK</span>
+      </button>
+      <button type="button" class="tbtn drop" data-press="dropLast">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v13M6 11l6 6 6-6M5 21h14"/></svg>
+        <span>DROP</span>
+      </button>
     </div>
   </div>
 

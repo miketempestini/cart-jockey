@@ -48,57 +48,101 @@ body.touch-ui[data-phase='countdown'] #touch {
   touch-action: none;
 }
 
+/* Candy-colored, chunky and round, with a darker lip underneath. */
 .stick {
   position: relative;
   width: 132px;
   height: 132px;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.12);
-  border: 2px solid rgba(255, 255, 255, 0.35);
+  background: rgba(255, 246, 226, 0.28);
+  border: 3px solid #3b2b2b;
+  box-shadow: 0 5px 0 rgba(59, 43, 43, 0.45), inset 0 0 0 8px rgba(23, 163, 156, 0.35);
 }
 
 .knob {
   position: absolute;
   left: 50%;
   top: 50%;
-  width: 56px;
-  height: 56px;
-  margin: -28px 0 0 -28px;
+  width: 58px;
+  height: 58px;
+  margin: -29px 0 0 -29px;
   border-radius: 50%;
-  background: rgba(255, 138, 31, 0.85);
-  border: 2px solid rgba(0, 0, 0, 0.4);
+  background: radial-gradient(circle at 35% 30%, #45c9c1, #17a39c 60%);
+  border: 3px solid #3b2b2b;
+  box-shadow: 0 4px 0 #0f7d77;
 }
 
 .pad {
   display: grid;
   grid-template-columns: auto auto;
   grid-template-rows: auto auto;
-  gap: 10px;
+  gap: 12px;
   align-items: end;
 }
 
 .tbtn {
+  --cap: #ffe08a;
+  --lip: #d9ae3a;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
   width: 72px;
   height: 72px;
   border-radius: 50%;
-  border: 2px solid rgba(255, 255, 255, 0.45);
-  background: rgba(0, 0, 0, 0.45);
-  color: #f2f2f2;
-  font: bold 12px system-ui, sans-serif;
-  line-height: 1.2;
+  border: 3px solid #3b2b2b;
+  background: radial-gradient(circle at 35% 28%, rgba(255, 255, 255, 0.55), transparent 45%), var(--cap);
+  box-shadow: 0 6px 0 var(--lip), 0 8px 0 rgba(59, 43, 43, 0.35);
+  color: #3b2b2b;
+  font: 900 10px "ui-rounded", "SF Pro Rounded", "Arial Rounded MT Bold", system-ui, sans-serif;
+  letter-spacing: 0.02em;
   padding: 0;
+}
+
+.tbtn svg {
+  width: 26px;
+  height: 26px;
+  fill: #3b2b2b;
+  stroke: #3b2b2b;
+  stroke-width: 0;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.tbtn.sprint {
+  --cap: #8fdcb8;
+  --lip: #4fae85;
+}
+
+.tbtn.drop {
+  --cap: #ffe08a;
+  --lip: #d9ae3a;
+}
+
+.tbtn.drop svg {
+  fill: none;
+  stroke-width: 3;
 }
 
 .tbtn.big {
   grid-row: span 2;
-  width: 88px;
-  height: 88px;
-  background: rgba(255, 210, 63, 0.3);
-  border-color: rgba(255, 210, 63, 0.8);
+  width: 92px;
+  height: 92px;
+  --cap: #ff7a66;
+  --lip: #b83a2c;
+  color: #fff6e2;
+}
+
+.tbtn.big svg {
+  width: 36px;
+  height: 28px;
+  fill: #fff6e2;
 }
 
 .tbtn.active {
-  background: rgba(255, 255, 255, 0.35);
+  transform: translateY(4px);
+  box-shadow: 0 2px 0 var(--lip), 0 4px 0 rgba(59, 43, 43, 0.35);
 }
 
 /* On a phone held upright the lot is small; suggest turning it. */

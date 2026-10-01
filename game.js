@@ -16,6 +16,11 @@ const CONFIG = {
   staminaRegen: 25, // per second while not sprinting
   staminaRegenDelay: 0.6, // seconds after sprinting before regen starts
   staminaMinToSprint: 20, // once empty, must recover this much to sprint again
+  // Energy drinks (chapters 3-5): walk over one for unlimited sprint. Another
+  // one while boosted adds its time on top.
+  drinkBoost: 30, // seconds of unlimited sprint per drink
+  drinkPickup: 18, // player center to drink center
+  drinkSpawnFrac: 0.3, // never closer to the start than this share of the world's diagonal
   grabRange: 44, // empty-handed: max distance from player center to a cart center
   latchRange: 34, // with a train: max distance from the hitch at the nose to a cart center
   latchCone: (70 * Math.PI) / 180, // the cart must be within this angle of straight ahead of the nose
@@ -476,9 +481,10 @@ function expandTemplate(t) {
 
 // The five chapters: one map each, five levels each.
 const CHAPTERS = [
-  { name: 'Corner Store', layout: LAYOUTS.classic },
+  { name: 'Corner Store', drinks: 0, layout: LAYOUTS.classic },
   {
     name: 'Strip Mall',
+    drinks: 0,
     layout: expandTemplate({
       name: 'Strip Mall', stalls: 24, rows: 3, storeH: 104, doorsX: 330, doorsW: 104, corralX: 592,
       bins: [{ row: 'C', stall: 3 }, { row: 'C', stall: 20 }], gateX: [360, 1000],
@@ -486,6 +492,7 @@ const CHAPTERS = [
   },
   {
     name: 'Supermarket',
+    drinks: 2,
     layout: expandTemplate({
       name: 'Supermarket', stalls: 28, rows: 5, storeH: 120, doorsX: 420, doorsW: 112, corralX: 688,
       gaps: [[13, 14]], bins: [{ row: 'C', stall: 3 }, { row: 'E', stall: 16 }, { row: 'B', stall: 23 }], gateX: [380, 1160],
@@ -493,6 +500,7 @@ const CHAPTERS = [
   },
   {
     name: 'Supercenter',
+    drinks: 3,
     layout: expandTemplate({
       name: 'Supercenter', stalls: 36, rows: 7, storeH: 136, doorsX: 560, doorsW: 120, corralX: 880,
       gaps: [[17, 18]], bins: [{ row: 'C', stall: 4 }, { row: 'E', stall: 28 }, { row: 'G', stall: 10 }, { row: 'A', stall: 33 }],
@@ -501,6 +509,7 @@ const CHAPTERS = [
   },
   {
     name: 'Warehouse',
+    drinks: 4,
     layout: expandTemplate({
       name: 'Warehouse', stalls: 44, rows: 9, storeH: 152, doorsX: 640, doorsW: 128, corralX: 1072,
       gaps: [[14, 15], [29, 30]], overflow: { pair: 4, gap: 48 },
@@ -647,6 +656,7 @@ function makePlayer() {
     sprinting: false,
     exhausted: false,
     regenDelay: 0,
+    boost: 0, // seconds of unlimited sprint left from energy drinks
     invuln: 0,
     stun: 0,
     // Carts being pushed, nearest the player first. Each link is
@@ -683,6 +693,7 @@ function loadSaved() {
     highScore: 0,
     bestComboLevel: 0,
     muted: false,
+    drinkIntroSeen: false, // the energy drink explainer has been shown in Story
     story: { unlocked: 1, completed: false, bests: {} },
     free: { bests: {} },
   };
@@ -694,6 +705,7 @@ function loadSaved() {
         saved.bestComboLevel = Math.min(Math.max(0, raw.bestComboLevel), CONFIG.comboMults.length - 1);
       }
       saved.muted = raw.muted === true;
+      saved.drinkIntroSeen = raw.drinkIntroSeen === true;
       if (raw.story && typeof raw.story === 'object') {
         if (Number.isInteger(raw.story.unlocked)) saved.story.unlocked = Math.min(Math.max(1, raw.story.unlocked), LEVELS.length);
         saved.story.completed = raw.story.completed === true;
@@ -740,6 +752,7 @@ const state = {
   strayTimer: CONFIG.strayRespawn,
   nextCartId: 1,
   carts: [], // status: 'inBin' | 'loose' | 'train'
+  drinks: [], // energy drinks still in the lot: { x, y } centers; none come back during a shift
   parked: new Map(), // space id -> { color }
   reserved: new Set(), // space ids a moving car is heading into or backing out of
   traffic: [], // cars driving to or from spaces
@@ -789,6 +802,14 @@ function fxDock(carts, comboUp) {
   else if (n >= 3) text = 'NICE TRAIN!';
   else if (carts.some((c) => c.kind === 'stray')) text = 'STRAY SAVED!';
   if (text) fx.sticker = { text, t: 0 };
+}
+
+function fxDrink(at) {
+  fx.sticker = { text: 'ENERGY!', t: 0 };
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    fx.puffs.push({ x: at.x + Math.cos(a) * 12, y: at.y + Math.sin(a) * 6, t: 0, life: 0.5 + Math.random() * 0.3 });
+  }
 }
 
 function fxHonk(car) {
@@ -865,6 +886,55 @@ function spawnStray() {
   return makeCart('stray', spot.x, spot.y, spot.angle + jitter, 'loose');
 }
 
+// Energy drinks for this shift, in new spots every time: about half off the
+// road (sidewalk, painted islands, lot edges) and the rest out on open
+// asphalt (lanes, empty stalls). All far from the start and spread apart, so
+// they take some hunting. A drink under a car that parks later stays put.
+function placeDrinks(count) {
+  if (!count) return [];
+  const start = LOT.playerStart;
+  const minStart = CONFIG.drinkSpawnFrac * Math.hypot(LOT.width, LOT.height);
+  const solids = [...LOT.staticSolids, ...LOT.bins.map((b) => b.rect), LOT.corralArea];
+  for (const id of state.parked.keys()) solids.push(LOT.spaceById[id].rect);
+  for (const c of state.carts) solids.push(c);
+  const walkable = [LOT.asphalt, LOT.sidewalk];
+  const road = [...LOT.laneBands, ...LOT.spaces.map((s) => s.rect)];
+  const pools = { off: [], road: [] };
+  for (let y = 12; y < LOT.height - 12; y += 16) {
+    for (let x = 12; x < LOT.width - 12; x += 16) {
+      const box = { x: x - 12, y: y - 12, w: 24, h: 24 };
+      if (!walkable.some((r) => pointIn({ x, y }, r)) || solids.some((r) => overlaps(r, box))) continue;
+      if (Math.hypot(x - start.x, y - start.y) < minStart) continue;
+      pools[road.some((r) => pointIn({ x, y }, r)) ? 'road' : 'off'].push({ x, y });
+    }
+  }
+  const chosen = [];
+  const gap = (pt) => Math.min(...chosen.map((c) => Math.hypot(c.x - pt.x, c.y - pt.y)));
+  for (let i = 0; i < count; i++) {
+    let pool = pools[i % 2 ? 'road' : 'off'];
+    if (!pool.length) pool = pools[i % 2 ? 'off' : 'road'];
+    if (!pool.length) break;
+    // Farthest from the drinks so far, with some randomness: any spot at
+    // least 65% as far apart as the best one.
+    let pick;
+    if (!chosen.length) pick = pool[Math.floor(rng() * pool.length)];
+    else {
+      const best = Math.max(...pool.map(gap));
+      const good = pool.filter((pt) => gap(pt) >= best * 0.65);
+      pick = good[Math.floor(rng() * good.length)];
+    }
+    chosen.push({ x: pick.x, y: pick.y });
+    for (const k of ['off', 'road']) pools[k] = pools[k].filter((pt) => pt !== pick);
+  }
+  return chosen;
+}
+
+// Does this level start with the energy drink explainer? Only the first
+// time Story reaches a chapter with drinks.
+function needsDrinkIntro() {
+  return state.mode === 'story' && CHAPTERS[LEVEL.chapter - 1].drinks > 0 && !state.saved.drinkIntroSeen;
+}
+
 // Switch to level n (1-25): its chapter's map and its traffic, shopper and
 // stray settings, then start a fresh shift there.
 function loadLevel(n, mode = state.mode) {
@@ -874,6 +944,7 @@ function loadLevel(n, mode = state.mode) {
   LOT = buildLot(CHAPTERS[LEVEL.chapter - 1].layout);
   rebuildPedGrid();
   resetSession();
+  if (needsDrinkIntro()) setPhase('drinkIntro'); // the countdown waits behind it
 }
 
 // Start a fresh shift.
@@ -917,6 +988,7 @@ function resetSession() {
   for (let i = 0; i < LOT.binCapacity; i++) spawnCartInBin();
   for (let i = 0; i < LEVEL.strays; i++) spawnStray();
   rng = Math.random;
+  state.drinks = placeDrinks(CHAPTERS[LEVEL.chapter - 1].drinks);
 
   // Hold everything for "3, 2, 1, GO" before the clock starts.
   setPhase('countdown');
@@ -1040,6 +1112,12 @@ function pressAction(action, source = 'keyboard') {
     loadLevel(n, state.selectMode);
     return;
   }
+  if (action === 'drinkGo' && phase === 'drinkIntro') {
+    state.saved.drinkIntroSeen = true;
+    persist();
+    setPhase('countdown');
+    return;
+  }
   if (action === 'howto' && phase === 'title') return setPhase('howto');
   if (action === 'title') return setPhase('title');
   if (action === 'pause' && phase === 'playing') return setPhase('paused');
@@ -1050,6 +1128,7 @@ function pressAction(action, source = 'keyboard') {
     else if (phase === 'howto' || phase === 'mode') setPhase('title');
     else if (phase === 'levels') setPhase('mode');
     else if (phase === 'complete') pressAction('levels', source);
+    else if (phase === 'drinkIntro') pressAction('drinkGo', source);
     return;
   }
 
@@ -1124,6 +1203,8 @@ function menuButtons() {
       ];
     case 'howto':
       return [{ label: 'Back', action: 'title', x: bx, y: 440, w: bw, h: bh }];
+    case 'drinkIntro':
+      return [{ label: "Let's go!", action: 'drinkGo', primary: true, x: bx, y: 426, w: bw, h: bh }];
     case 'paused':
       return [
         { label: 'Resume', action: 'resume', x: bx, y: 206, w: bw, h: bh },
@@ -1394,6 +1475,12 @@ const sfx = (() => {
     honk: () => play('honk', () => {
       tone('sawtooth', 392, 0, 0.35, 0.12);
       tone('sawtooth', 494, 0, 0.35, 0.1);
+    }),
+    // Energy drink: a can pop and a rising zing.
+    slurp: () => play('slurp', () => {
+      noise(0, 0.06, 0.6, 3200);
+      tone('sine', 440, 0.05, 0.35, 0.25, 1320);
+      tone('triangle', 660, 0.12, 0.3, 0.15, 1760);
     }),
     // Start countdown: a short beep for 3, 2, 1 and a higher, longer one for GO.
     countBeep: () => play('countBeep', () => tone('sine', 523, 0, 0.16, 0.3)),
@@ -1727,6 +1814,15 @@ function moveGroup(bodies, dx, dy) {
 }
 
 function updateStamina(p, moving, dt) {
+  // Energy drink: sprint as much as you like and the meter stays full.
+  if (p.boost > 0) {
+    p.boost = Math.max(0, p.boost - dt);
+    p.stamina = CONFIG.staminaMax;
+    p.exhausted = false;
+    p.regenDelay = 0;
+    p.sprinting = held.sprint && moving;
+    return;
+  }
   if (p.exhausted && p.stamina >= CONFIG.staminaMinToSprint) p.exhausted = false;
   p.sprinting = held.sprint && moving && !p.exhausted && p.stamina > 0;
 
@@ -1816,6 +1912,20 @@ function updatePlayer(dt) {
     p.facingY = dy;
   }
   moveGroup([p], dx * speed * dt, dy * speed * dt);
+}
+
+// Walking over an energy drink drinks it: 30 more seconds of unlimited sprint.
+function updateDrinks() {
+  const p = state.player;
+  const pc = center(p);
+  const left = state.drinks.filter((d) => Math.hypot(d.x - pc.x, d.y - pc.y) > CONFIG.drinkPickup);
+  const got = state.drinks.length - left.length;
+  if (!got) return;
+  state.drinks = left;
+  p.boost += CONFIG.drinkBoost * got;
+  fxDrink(pc);
+  sfx.slurp();
+  showMessage(`ENERGY DRINK! Unlimited sprint ${Math.ceil(p.boost)}s`);
 }
 
 // Carts in the bin slide toward the open end to fill any gap, but stop
@@ -2665,6 +2775,7 @@ function update(dt) {
   if (state.phase !== 'playing') return;
   state.goFlash = Math.max(0, state.goFlash - dt);
   updatePlayer(dt);
+  updateDrinks();
   updateVehicles(dt);
   updateShoppers(dt);
   updateBin(dt);
@@ -3218,6 +3329,37 @@ function drawCartIcon(x, y, s, smile) {
   ctx.restore();
 }
 
+// An energy drink can: purple with a lime bolt, a silver lid and pull tab.
+// Drawn standing up, (x, y) at the base, s = scale (1 is about 12x18).
+function drawDrinkCan(x, y, s) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(s, s);
+  rr(-6, -18, 12, 18, 4, '#7c4dff', COLORS.outline, 2);
+  rr(-6, -18, 4, 18, 2, 'rgba(255, 255, 255, 0.28)'); // shine
+  ctx.beginPath();
+  ctx.moveTo(1.5, -15);
+  ctx.lineTo(-3, -8);
+  ctx.lineTo(0, -8);
+  ctx.lineTo(-1.5, -3);
+  ctx.lineTo(3.5, -10);
+  ctx.lineTo(0.5, -10);
+  ctx.closePath();
+  ctx.fillStyle = '#b6f03c';
+  ctx.fill();
+  ctx.strokeStyle = COLORS.outline;
+  ctx.lineWidth = 0.8;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.ellipse(0, -18, 6, 2.2, 0, 0, Math.PI * 2);
+  ctx.fillStyle = '#d7dde6';
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  rr(-1, -19.5, 4, 2, 1, '#9aa4b2');
+  ctx.restore();
+}
+
 // ---- Props ---------------------------------------------------------------
 
 // Rounded-box footprint path for a local frame.
@@ -3615,6 +3757,23 @@ function drawRail(r, height, flash) {
   });
 }
 
+// A drink in the lot: bobbing a little over its shadow with a soft glow,
+// so it stands out once it's on screen.
+function drawDrinkProp(d) {
+  const s = depthScale(d.y);
+  const bob = Math.sin(fx.time * 4 + d.x * 0.05) * 2.5;
+  const glow = 0.35 + 0.2 * Math.sin(fx.time * 6 + d.y);
+  const g = ctx.createRadialGradient(d.x, d.y - 8, 2, d.x, d.y - 8, 22);
+  g.addColorStop(0, `rgba(182, 240, 60, ${glow})`);
+  g.addColorStop(1, 'rgba(182, 240, 60, 0)');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(d.x, d.y - 8, 22, 0, Math.PI * 2);
+  ctx.fill();
+  groundShadow(d.x, d.y + 2, 7 * s, 3 * s);
+  drawDrinkCan(d.x, d.y - 3 + bob, s);
+}
+
 function drawIslandProp(isl) {
   const cx = isl.x + isl.w / 2;
   const cy = isl.y + isl.h / 2;
@@ -3693,6 +3852,7 @@ function drawWorld() {
     const alpha = g.t < 0.35 ? 1 : Math.max(0, 1 - (g.t - 0.35) / 0.4);
     add(g.y + 10, () => drawCartProp(g.x, g.y, g.angle, g.kind, { lift: 6 * (1 - settle), alpha }));
   }
+  for (const d of state.drinks) add(d.y + 2, () => drawDrinkProp(d), d.x, d.y);
   add(state.player.y + state.player.h, drawPlayerProp);
   for (const sh of state.shoppers) add(sh.y + CONFIG.shopperSize / 2, () => drawShopperProp(sh), sh.x, sh.y);
   for (const isl of LOT.islands) add(isl.y + isl.h, () => drawIslandProp(isl), isl.x + isl.w / 2, Math.max(isl.y, Math.min(isl.y + isl.h, cam.y + H / 2)));
@@ -3933,8 +4093,9 @@ function drawHud() {
 
   // Stamina: a lightning bolt and a rounded meter
   const sy = H - 46;
-  pill(12, sy, 206, 34, COLORS.cream, 17);
-  ctx.fillStyle = p.exhausted ? COLORS.tomato : COLORS.gold;
+  const boosted = p.boost > 0;
+  pill(12, sy, 206, 34, boosted ? '#efe6ff' : COLORS.cream, 17);
+  ctx.fillStyle = boosted ? '#b6f03c' : p.exhausted ? COLORS.tomato : COLORS.gold;
   ctx.strokeStyle = COLORS.outline;
   ctx.lineWidth = 1.5;
   ctx.beginPath();
@@ -3947,7 +4108,28 @@ function drawHud() {
   ctx.closePath();
   ctx.fill();
   ctx.stroke();
-  meter(46, sy + 10, 160, 14, p.stamina / CONFIG.staminaMax, p.exhausted ? COLORS.tomato : '#5fcf8a');
+  if (boosted) {
+    // Unlimited sprint: a full purple meter with the seconds left on it,
+    // blinking in the last five.
+    const blink = p.boost < 5 && Math.floor(fx.time * 6) % 2 === 0;
+    meter(46, sy + 10, 160, 14, 1, blink ? '#b6f03c' : '#7c4dff');
+    text(`UNLIMITED  ${Math.ceil(p.boost)}s`, 126, sy + 17.5, 10, COLORS.cream, 'center');
+  } else {
+    meter(46, sy + 10, 160, 14, p.stamina / CONFIG.staminaMax, p.exhausted ? COLORS.tomato : '#5fcf8a');
+  }
+
+  // Energy drinks still out in the lot, on chapters that have them.
+  const total = CHAPTERS[LEVEL.chapter - 1].drinks;
+  if (total) {
+    const dw = 26 + total * 18;
+    pill(224, sy, dw, 34, COLORS.cream, 17);
+    for (let i = 0; i < total; i++) {
+      ctx.save();
+      ctx.globalAlpha = i < state.drinks.length ? 1 : 0.25;
+      drawDrinkCan(246 + i * 18, sy + 27, 0.95);
+      ctx.restore();
+    }
+  }
 
   // Keyboard controls, bottom right. Touch players have the on-screen pad instead.
   if (!state.touchUi) {
@@ -4268,13 +4450,51 @@ function drawHowTo() {
     'Dock again within 12 seconds with freshly collected carts to climb the combo: 1.5x, 2x, 3x.',
     'Cars come and go all shift. A hit drops your whole train and costs 5 seconds.',
     `${touch ? 'DROP' : 'Q'} drops the last cart. ${touch ? 'The pause button' : 'Esc'} pauses. Grade is your score against par.`,
+    'From Chapter 3, hunt the lot for energy drinks: each gives 30 seconds of unlimited sprint.',
   ];
   const dots = [COLORS.tomato, COLORS.gold, COLORS.teal, '#5b7fe0', '#ff8a70', '#b99af0', '#7ed9b0', '#ffb38a'];
   lines.forEach((line, i) => {
-    const y = 136 + i * 35;
+    const y = 134 + i * 32;
     circle(150, y, 6, dots[i % dots.length], COLORS.outline, 1.5);
     text(line, 166, y, 14.5, COLORS.ink, 'left', 700);
   });
+  drawMenuButtons();
+}
+
+// Shown once, the first time Story reaches Chapter 3: what the energy drink
+// is and how it works, with a big picture of it.
+function drawDrinkIntro() {
+  dim(0.55);
+  awningCard(100, 56, W - 200, 438);
+  stickerText('NEW: ENERGY DRINKS!', W / 2, 104, 30, '#b6f03c');
+
+  // The can, big, on a glowing burst
+  const cx = 232, cy = 270;
+  const g = ctx.createRadialGradient(cx, cy - 40, 10, cx, cy - 40, 110);
+  g.addColorStop(0, 'rgba(182, 240, 60, 0.55)');
+  g.addColorStop(1, 'rgba(182, 240, 60, 0)');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(cx, cy - 40, 110, 0, Math.PI * 2);
+  ctx.fill();
+  groundShadow(cx, cy + 34, 44, 12);
+  drawDrinkCan(cx, cy + 34 + Math.sin(fx.time * 3) * 4, 6);
+
+  const lines = [
+    ['What', 'Cans of energy hidden around the parking lot.'],
+    ['Grab', 'Walk over one to drink it, with or without a train.'],
+    ['Boost', `${CONFIG.drinkBoost}s of unlimited sprint: hold ${state.touchUi ? 'SPRINT' : 'Shift'}, no stamina used.`],
+    ['Stack', `Drink another while boosted for ${CONFIG.drinkBoost} more seconds.`],
+    ['Hunt', 'Far from where you start, in new spots every shift.'],
+    ['Count', 'Chapter 3 has 2, Chapter 4 has 3, Chapter 5 has 4. No refills!'],
+  ];
+  lines.forEach(([k, v], i) => {
+    const y = 162 + i * 40;
+    rr(360, y - 12, 62, 24, 12, '#7c4dff', COLORS.outline, 1.5);
+    text(k.toUpperCase(), 391, y + 0.5, 11, COLORS.cream, 'center');
+    text(v, 434, y, 14, COLORS.ink, 'left', 700);
+  });
+  text('The HUD shows how many cans are left and your boost time.', W / 2, 404, 12.5, COLORS.tomatoDark, 'center', 800);
   drawMenuButtons();
 }
 
@@ -4867,6 +5087,7 @@ function draw() {
   else if (phase === 'levels') drawLevelSelect();
   else if (phase === 'complete') drawStoryComplete();
   else if (phase === 'howto') drawHowTo();
+  else if (phase === 'drinkIntro') drawDrinkIntro();
   else if (phase === 'paused') drawPaused();
   else if (phase === 'over') drawTally();
   drawHudButtons();
@@ -4901,5 +5122,5 @@ window.lotRunner = {
   spawnStray, spawnArrival, spawnDeparture, findRoute, trainBonus, gradeFor, scorePercent,
   inputLog, sfx, menuButtons, hudButtons, persist, STORE_KEY,
   spawnShopperFromStore, planWalk, makeLook, LAYOUTS, buildLot,
-  loadLevel, LEVELS, CHAPTERS, levelInfo, expandTemplate, endShift, PASS_PERCENT,
+  loadLevel, LEVELS, CHAPTERS, levelInfo, expandTemplate, endShift, PASS_PERCENT, placeDrinks,
 };

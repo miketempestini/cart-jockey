@@ -47,7 +47,6 @@ const CONFIG = {
   finalStretch: 20, // the clock goes big and ticks for the last this-many seconds
   comboWindow: 12, // seconds after a dock to land the next one
   comboMults: [1, 1.5, 2, 3],
-  strayMax: 3, // strays out in the lot at once
   strayRespawn: 10, // seconds between stray spawns while below the max
   strayMinSpawnDist: 120, // strays never pop in right next to the player
   // Vehicles
@@ -55,17 +54,10 @@ const CONFIG = {
   carWidth: 34,
   trafficSpeed: 95, // cars driving to and from spaces
   parkingSpeed: 45, // pulling in and backing out
-  parkedStart: 24,
-  parkedMin: 16,
-  parkedMax: 32,
-  trafficMaxMoving: 3, // cars driving around at once
-  arriveEvery: [4, 9], // random seconds between cars arriving
   // Shoppers. Cars leave when their shopper comes back out of the store.
   shopperSize: 14,
   shopperSpeed: 44, // walking
   shopperCartSpeed: 38, // pushing a cart
-  shopperExitEvery: [4, 9], // random seconds between shoppers leaving the store
-  maxShoppers: 7, // out in the lot at once
   abandonChance: 0.4, // chance a shopper leaves the cart by their car instead of returning it
   shopperReplanAfter: 1.5, // seconds stuck before a shopper walks around what's blocking them
   spotWaitMax: 6, // a car gives up on a blocked space after this long and drives out
@@ -75,7 +67,6 @@ const CONFIG = {
   hitStun: 0.4, // seconds of no control after a hit
   // Grading: the shift's score as a percentage of par, on a standard school
   // scale. Par is the score a solid shift should reach; tune it after playtests.
-  parScore: 1500,
   grades: [
     { min: 90, grade: 'A' },
     { min: 80, grade: 'B' },
@@ -92,54 +83,109 @@ const CART_SIZE = 20;
 // lanes are)
 // ---------------------------------------------------------------------------
 
+// Every stall in every lot is the same size.
 const SPACE_W = 48;
 const SPACE_D = 64;
-const ROW_X0 = 96;
-const ROW_COUNT = 16;
 const RAIL = 6;
-const BIN_INDEX = 7; // row C, two spaces wide
 
 // Candy car paint: mint, butter, coral, blueberry, lilac, peach, sky, cherry.
 const CAR_COLORS = ['#7ed9b0', '#ffe08a', '#ff8a70', '#5b7fe0', '#b99af0', '#ffb38a', '#7cc8f0', '#f06c8a'];
 
-// Traffic lanes are one-way and follow the painted arrows: east along the
-// fire lane, south down the right edge, west along the bottom and the middle
-// aisle, north up the left edge. Four entrances connect them to the street,
-// each with a separate IN and OUT lane so cars never meet head-on.
-const LANE_NODES = {
-  FW: { x: 28, y: 180 }, FE: { x: 932, y: 180 },
-  MW: { x: 28, y: 360 }, ME: { x: 932, y: 360 },
-  L2: { x: 28, y: 430 }, R2: { x: 932, y: 430 },
-  BW: { x: 28, y: 500 }, BE: { x: 932, y: 500 },
-  B1x: { x: 240, y: 500 }, B1i: { x: 300, y: 500 },
-  B2x: { x: 640, y: 500 }, B2i: { x: 700, y: 500 },
-  // Entrance ends sit just off screen so cars drive in and out of view.
-  GWi: { x: -40, y: 430 }, GWo: { x: -40, y: 360 },
-  GEi: { x: 1000, y: 360 }, GEo: { x: 1000, y: 430 },
-  GS1i: { x: 300, y: 580 }, GS1o: { x: 240, y: 580 },
-  GS2i: { x: 700, y: 580 }, GS2o: { x: 640, y: 580 },
+// Lot templates are pure data. buildLot() turns one into the LOT the rules,
+// shoppers and drawing all read from; nothing else hard-codes the lot.
+//
+//   world        size of the playable world
+//   store        the building (solid), doors, and decoration spots on its front
+//   sidewalk     walkable strip in front of the store; corral sits on it
+//   asphalt      the paved lot
+//   corral       the player's return pen (open side faces the lot)
+//   rows         stall rows: left edge, top, stall count, which side cars pull
+//                in from, and the one-way lane edge that serves them
+//   bins         cart return bins, each taking `stalls` stalls of a row
+//   islands      planters (solid)
+//   lamps        lamp post centers (solid)
+//   accessible   stall ids painted blue
+//   lanes        car waypoint graph: nodes, one-way edges, and entrances
+//   curbSpots    where strays can be left on the curb (cart centers)
+//   playerStart  where the attendant starts (center)
+const LAYOUTS = {
+  // The original single lot: three rows, one bin, four entrances.
+  classic: {
+    name: 'Classic Lot',
+    world: { w: 960, h: 540 },
+    store: {
+      rect: { x: 0, y: 0, w: 960, h: 96 },
+      doors: { x: 232, y: 80, w: 96, h: 16 },
+      signX: 480, // GROCERY sign center
+      boardX: 594, // "Please return your carts" board
+      windows: [[20, 214], [346, 382], [708, 940]], // x spans of the front windows
+    },
+    sidewalk: { x: 0, y: 96, w: 960, h: 64 },
+    asphalt: { x: 0, y: 156, w: 960, h: 384 },
+    corral: { x: 400, y: 100, w: 160, h: 60 },
+    rows: [
+      { id: 'A', x: 96, y: 200, stalls: 16, open: 'up', lane: ['FW', 'FE'] },
+      { id: 'B', x: 96, y: 264, stalls: 16, open: 'down', lane: ['ME', 'MW'] },
+      { id: 'C', x: 96, y: 392, stalls: 16, open: 'up', lane: ['ME', 'MW'] },
+    ],
+    bins: [{ row: 'C', stall: 7, stalls: 2, depth: 4 }],
+    islands: [
+      { x: 56, y: 200, w: 40, h: 128 },
+      { x: 864, y: 200, w: 40, h: 128 },
+      { x: 56, y: 392, w: 40, h: 64 },
+      { x: 864, y: 392, w: 40, h: 64 },
+    ],
+    lamps: [{ x: 672, y: 264 }, { x: 288, y: 424 }, { x: 672, y: 424 }],
+    accessible: ['A2', 'A4'],
+    // Traffic lanes are one-way and follow the painted arrows: east along the
+    // fire lane, south down the right edge, west along the bottom and the
+    // middle aisle, north up the left edge. Four entrances connect them to the
+    // street, each with a separate IN and OUT lane so cars never meet head-on.
+    lanes: {
+      nodes: {
+        FW: { x: 28, y: 180 }, FE: { x: 932, y: 180 },
+        MW: { x: 28, y: 360 }, ME: { x: 932, y: 360 },
+        L2: { x: 28, y: 430 }, R2: { x: 932, y: 430 },
+        BW: { x: 28, y: 500 }, BE: { x: 932, y: 500 },
+        B1x: { x: 240, y: 500 }, B1i: { x: 300, y: 500 },
+        B2x: { x: 640, y: 500 }, B2i: { x: 700, y: 500 },
+        // Entrance ends sit just off the world edge so cars drive in and out of view.
+        GWi: { x: -40, y: 430 }, GWo: { x: -40, y: 360 },
+        GEi: { x: 1000, y: 360 }, GEo: { x: 1000, y: 430 },
+        GS1i: { x: 300, y: 580 }, GS1o: { x: 240, y: 580 },
+        GS2i: { x: 700, y: 580 }, GS2o: { x: 640, y: 580 },
+      },
+      edges: [
+        ['FW', 'FE'], ['FE', 'ME'], ['ME', 'R2'], ['R2', 'BE'],
+        ['BE', 'B2i'], ['B2i', 'B2x'], ['B2x', 'B1i'], ['B1i', 'B1x'], ['B1x', 'BW'],
+        ['BW', 'L2'], ['L2', 'MW'], ['MW', 'FW'], ['ME', 'MW'],
+        ['GWi', 'L2'], ['MW', 'GWo'], ['GEi', 'ME'], ['R2', 'GEo'],
+        ['GS1i', 'B1i'], ['B1x', 'GS1o'], ['GS2i', 'B2i'], ['B2x', 'GS2o'],
+      ],
+      gates: [
+        { label: 'W', in: 'GWi', out: 'GWo', side: 'left' },
+        { label: 'E', in: 'GEi', out: 'GEo', side: 'right' },
+        { label: 'S1', in: 'GS1i', out: 'GS1o', side: 'bottom' },
+        { label: 'S2', in: 'GS2i', out: 'GS2o', side: 'bottom' },
+      ],
+    },
+    curbSpots: [{ x: 110, y: 146 }, { x: 190, y: 146 }, { x: 640, y: 146 }, { x: 760, y: 146 }, { x: 860, y: 146 }],
+    playerStart: { x: 480, y: 249 },
+  },
 };
-const LANE_EDGES = [
-  ['FW', 'FE'], ['FE', 'ME'], ['ME', 'R2'], ['R2', 'BE'],
-  ['BE', 'B2i'], ['B2i', 'B2x'], ['B2x', 'B1i'], ['B1i', 'B1x'], ['B1x', 'BW'],
-  ['BW', 'L2'], ['L2', 'MW'], ['MW', 'FW'], ['ME', 'MW'],
-  ['GWi', 'L2'], ['MW', 'GWo'], ['GEi', 'ME'], ['R2', 'GEo'],
-  ['GS1i', 'B1i'], ['B1x', 'GS1o'], ['GS2i', 'B2i'], ['B2x', 'GS2o'],
-];
-const GATES = [
-  { label: 'W', in: 'GWi', out: 'GWo', side: 'left', span: [360, 430] },
-  { label: 'E', in: 'GEi', out: 'GEo', side: 'right', span: [360, 430] },
-  { label: 'S1', in: 'GS1i', out: 'GS1o', side: 'bottom', span: [240, 300] },
-  { label: 'S2', in: 'GS2i', out: 'GS2o', side: 'bottom', span: [640, 700] },
-];
 
-function buildLot() {
-  const store = { x: 0, y: 0, w: W, h: 96 };
-  const sidewalk = { x: 0, y: 96, w: W, h: 64 };
-  const doors = { x: 232, y: 80, w: 96, h: 16 };
+// Turn a layout template into the lot the game runs on: solids, stalls, bin
+// lanes, lanes for cars, and the spots shoppers walk to.
+function buildLot(layout) {
+  const world = { x: 0, y: 0, w: layout.world.w, h: layout.world.h };
+  const store = { ...layout.store.rect };
+  const doors = { ...layout.store.doors };
+  const sidewalk = { ...layout.sidewalk };
+  const asphalt = { ...layout.asphalt };
+  const lanes = layout.lanes;
 
   // Corral sits on the sidewalk, open side facing the lot.
-  const corral = { x: 400, y: 100, w: 160, h: 60 };
+  const corral = { ...layout.corral };
   const corralRails = [
     { x: corral.x, y: corral.y, w: corral.w, h: RAIL, kind: 'rail' },
     { x: corral.x, y: corral.y, w: RAIL, h: corral.h, kind: 'rail' },
@@ -154,39 +200,64 @@ function buildLot() {
   const pad = CONFIG.corralAreaPad;
   const corralArea = { x: returnZone.x - pad, y: returnZone.y - pad, w: returnZone.w + pad * 2, h: returnZone.h + pad * 2 };
 
-  // Parking rows: A and B are back to back, C is alone below the middle
-  // aisle. `open` is the side a car drives in from; `lane` is the lane edge
-  // that serves it.
-  const rows = [
-    { id: 'A', y: 200, open: 'up', laneY: 180, lane: ['FW', 'FE'] },
-    { id: 'B', y: 264, open: 'down', laneY: 360, lane: ['ME', 'MW'] },
-    { id: 'C', y: 392, open: 'up', laneY: 360, lane: ['ME', 'MW'] },
-  ];
-  const rowW = SPACE_W * ROW_COUNT;
+  // Rows: `open` is the side a car drives in from; `lane` is the lane edge
+  // that serves it. Cars turn in from that lane's line.
+  const rows = layout.rows.map((r) => ({
+    ...r,
+    w: r.stalls * SPACE_W,
+    laneY: lanes.nodes[r.lane[0]].y,
+  }));
+  const rowById = Object.fromEntries(rows.map((r) => [r.id, r]));
 
-  // Return bin takes two spaces in row C, open toward the aisle above it.
-  // Carts nest in two lanes and slide toward the open end.
-  const bin = { x: ROW_X0 + BIN_INDEX * SPACE_W, y: 392, w: SPACE_W * 2, h: SPACE_D };
-  const binRails = [
-    { x: bin.x, y: bin.y, w: RAIL, h: bin.h, kind: 'rail' },
-    { x: bin.x + bin.w - RAIL, y: bin.y, w: RAIL, h: bin.h, kind: 'rail' },
-    { x: bin.x, y: bin.y + bin.h - RAIL, w: bin.w, h: RAIL, kind: 'rail' },
-  ];
-  const laneW = (bin.w - RAIL * 2) / 2;
-  const binLanes = [0, 1].map((i) => ({ x: bin.x + RAIL + laneW * i + (laneW - CART_SIZE) / 2 }));
-  const binDepth = 4; // carts per lane
-  const binSlotY = (k) => bin.y + 6 + k * 10;
+  // Bins take stalls out of a row and open toward the row's aisle. Each stall
+  // of a bin is one lane of nested carts that slide toward the open end.
+  const bins = layout.bins.map((b) => {
+    const row = rowById[b.row];
+    const rect = { x: row.x + b.stall * SPACE_W, y: row.y, w: b.stalls * SPACE_W, h: SPACE_D };
+    const openUp = row.open === 'up';
+    const rails = [
+      { x: rect.x, y: rect.y, w: RAIL, h: rect.h, kind: 'rail' },
+      { x: rect.x + rect.w - RAIL, y: rect.y, w: RAIL, h: rect.h, kind: 'rail' },
+      { x: rect.x, y: openUp ? rect.y + rect.h - RAIL : rect.y, w: rect.w, h: RAIL, kind: 'rail' },
+    ];
+    return { ...b, rect, openUp, rails };
+  });
+  const binLanes = [];
+  bins.forEach((bin, bi) => {
+    const laneW = (bin.rect.w - RAIL * 2) / bin.stalls;
+    for (let i = 0; i < bin.stalls; i++) {
+      const x = bin.rect.x + RAIL + laneW * i + (laneW - CART_SIZE) / 2;
+      binLanes.push({
+        bin: bi,
+        x,
+        depth: bin.depth,
+        openUp: bin.openUp,
+        // Basket points into the bin, handle toward the aisle.
+        angle: bin.openUp ? Math.PI / 2 : -Math.PI / 2,
+        // Top-left y of the k-th cart from the open end.
+        slotY: (k) => (bin.openUp ? bin.rect.y + 6 + k * 10 : bin.rect.y + bin.rect.h - 6 - CART_SIZE - k * 10),
+        // Where a shopper hands a cart over: just inside the opening, off the driving lane.
+        mouth: { x: x + CART_SIZE / 2, y: bin.openUp ? bin.rect.y + 10 : bin.rect.y + bin.rect.h - 10 },
+      });
+    }
+  });
+  const binCapacity = binLanes.reduce((sum, l) => sum + l.depth, 0);
 
-  // Every parking space. A car parked in one is solid.
+  // Every parking stall not taken by a bin. A car parked in one is solid.
+  const binStalls = new Set();
+  for (const b of layout.bins) for (let i = 0; i < b.stalls; i++) binStalls.add(`${b.row}${b.stall + i}`);
+  // Painted no-parking gaps (a hatched island across a row) have no stalls.
+  const inGap = (row, i) => (row.gaps || []).some(([g0, g1]) => i >= g0 && i <= g1);
   const spaces = [];
   for (const row of rows) {
-    for (let i = 0; i < ROW_COUNT; i++) {
-      if (row.id === 'C' && (i === BIN_INDEX || i === BIN_INDEX + 1)) continue;
-      const x = ROW_X0 + i * SPACE_W;
+    for (let i = 0; i < row.stalls; i++) {
+      const id = `${row.id}${i}`;
+      if (binStalls.has(id) || inGap(row, i)) continue;
+      const x = row.x + i * SPACE_W;
       const cx = x + SPACE_W / 2;
       const cy = row.y + SPACE_D / 2;
       spaces.push({
-        id: `${row.id}${i}`, row: row.id, index: i,
+        id, row: row.id, index: i,
         rect: { x, y: row.y, w: SPACE_W, h: SPACE_D },
         center: { x: cx, y: cy },
         aisle: { x: cx, y: row.laneY }, // where a car turns in from its lane
@@ -198,48 +269,340 @@ function buildLot() {
   const spaceById = Object.fromEntries(spaces.map((s) => [s.id, s]));
 
   // Strays can also be left up on the sidewalk curb, clear of the doors and the corral.
-  const curbSpots = [110, 190, 640, 760, 860].map((x) => ({ x: x - CART_SIZE / 2, y: 136, angle: 0, where: 'curb' }));
+  const curbSpots = layout.curbSpots.map((c) => ({ x: c.x - CART_SIZE / 2, y: c.y - CART_SIZE / 2, angle: 0, where: 'curb' }));
+  const islands = layout.islands.map((r) => ({ ...r, kind: 'island' }));
+  const lampPosts = layout.lamps.map((c) => ({ x: c.x - 6, y: c.y - 6, w: 12, h: 12, kind: 'lamp' }));
 
-  const islands = [
-    { x: ROW_X0 - 40, y: 200, w: 40, h: SPACE_D * 2, kind: 'island' },
-    { x: ROW_X0 + rowW, y: 200, w: 40, h: SPACE_D * 2, kind: 'island' },
-    { x: ROW_X0 - 40, y: 392, w: 40, h: SPACE_D, kind: 'island' },
-    { x: ROW_X0 + rowW, y: 392, w: 40, h: SPACE_D, kind: 'island' },
-  ];
-
-  const lampPosts = [
-    { x: ROW_X0 + SPACE_W * 12 - 6, y: 264 - 6, w: 12, h: 12, kind: 'lamp' },
-    { x: ROW_X0 + SPACE_W * 4 - 6, y: 392 + SPACE_D / 2 - 6, w: 12, h: 12, kind: 'lamp' },
-    { x: ROW_X0 + SPACE_W * 12 - 6, y: 392 + SPACE_D / 2 - 6, w: 12, h: 12, kind: 'lamp' },
-  ];
-
-  // Accessible spaces nearest the store, in row A.
-  const accessibleSpaces = ['A2', 'A4'];
+  // The strips cars drive along: every lane edge widened to a car's width.
+  // Shoppers use these to avoid standing in the road.
+  const half = CONFIG.carWidth / 2;
+  const laneBands = lanes.edges.map(([a, b]) => {
+    const p = lanes.nodes[a];
+    const q = lanes.nodes[b];
+    return {
+      x: Math.min(p.x, q.x) - half,
+      y: Math.min(p.y, q.y) - half,
+      w: Math.abs(q.x - p.x) + half * 2,
+      h: Math.abs(q.y - p.y) + half * 2,
+    };
+  });
 
   // Solids that never move. Parked and moving cars are added each frame.
   const staticSolids = [
     { ...store, kind: 'store' },
     ...corralRails,
-    ...binRails,
+    ...bins.flatMap((b) => b.rails),
     ...islands,
     ...lampPosts,
   ];
 
   return {
-    store, sidewalk, doors, corral, corralRails, returnZone, corralArea, rows, rowW,
-    bin, binRails, binLanes, binDepth, binSlotY, spaces, spaceById, curbSpots,
-    islands, lampPosts, accessibleSpaces, staticSolids,
+    layout,
+    name: layout.name,
+    width: world.w,
+    height: world.h,
+    world, store, doors, sidewalk, asphalt, corral, corralRails, returnZone, corralArea,
+    rows, bins, binLanes, binRails: bins.flatMap((b) => b.rails), binCapacity,
+    spaces, spaceById, curbSpots, islands, lampPosts,
+    accessibleSpaces: layout.accessible,
+    painted: layout.painted || [], // hatched no-parking paint (decoration, walkable)
+    lanes, laneBands,
+    doorPoint: { x: doors.x + doors.w / 2, y: doors.y + doors.h + 14 }, // where shoppers come and go
+    playerStart: { ...layout.playerStart },
+    staticSolids,
   };
 }
 
-const LOT = buildLot();
-const BIN_CAPACITY = LOT.binLanes.length * LOT.binDepth;
+// ---- Chapter maps 2-5 -------------------------------------------------------
+//
+// Bigger lots are written as compact specs and expanded by a fixed rule into
+// the same layout shape as LAYOUTS.classic (no randomness: the same spec
+// always gives the same lot). The rule matches the classic lot: stall rows in
+// back-to-back pairs, one-way loop road (fire lane east, right edge south,
+// bottom west, left edge north), a westbound aisle between pairs, four
+// entrances with separate IN and OUT lanes.
+//
+//   stalls     stalls per row        rows     row count (odd)
+//   storeH     store depth           doorsX/W door position and width
+//   corralX    corral left edge      bins     [{ row, stall }] two-stall bins
+//   gaps       painted no-parking stall ranges in every row
+//   overflow   { pair, gap }: a painted median before that back-to-back pair
+//   gateX      x of the two bottom entrances
+const ROW_IDS = 'ABCDEFGHIJKL';
+
+function expandTemplate(t) {
+  const rowX = 96;
+  const rowW = t.stalls * SPACE_W;
+  const width = rowX + rowW + 96;
+  const storeH = t.storeH;
+  const fireY = storeH + 84;
+  const painted = [];
+  const rows = [];
+  const aisles = [];
+  const pairs = []; // back-to-back row index pairs
+  rows.push({ y: storeH + 104, open: 'up', aisle: 0 });
+  for (let k = 1; k <= (t.rows - 1) / 2; k++) {
+    const prevUp = rows[rows.length - 1];
+    const extra = t.overflow && t.overflow.pair === k ? t.overflow.gap : 0;
+    if (extra) painted.push({ x: rowX, y: prevUp.y + SPACE_D, w: rowW, h: extra });
+    const downY = prevUp.y + SPACE_D + extra;
+    pairs.push([rows.length - 1, rows.length, extra]);
+    rows.push({ y: downY, open: 'down', aisle: k });
+    const aisleY = downY + SPACE_D + 32;
+    aisles.push(aisleY);
+    rows.push({ y: aisleY + 32, open: 'up', aisle: k });
+  }
+  const lastRow = rows[rows.length - 1];
+  const botY = lastRow.y + SPACE_D + 44;
+  const height = botY + 40;
+  const RX = width - 28;
+  const gaps = t.gaps || [];
+
+  const layoutRows = rows.map((r, i) => ({
+    id: ROW_IDS[i], x: rowX, y: r.y, stalls: t.stalls, open: r.open, gaps,
+    lane: r.aisle === 0 ? ['FW', 'FE'] : [`A${r.aisle}E`, `A${r.aisle}W`],
+  }));
+  for (const r of layoutRows) {
+    for (const [g0, g1] of gaps) painted.push({ x: rowX + g0 * SPACE_W, y: r.y, w: (g1 - g0 + 1) * SPACE_W, h: SPACE_D });
+  }
+  const bins = t.bins.map((b) => ({ row: b.row, stall: b.stall, stalls: 2, depth: 4 }));
+
+  // Stall boundaries that are next to a bin or a gap get no lamp post.
+  const busy = (rowId, k) => bins.some((b) => b.row === rowId && k >= b.stall && k <= b.stall + 2)
+    || gaps.some(([g0, g1]) => k >= g0 && k <= g1 + 1);
+  const lamps = [];
+  for (const [top, bottom, extra] of pairs) {
+    const y = rows[top].y + SPACE_D + extra / 2;
+    for (let k = 4; k < t.stalls; k += 8) {
+      if (!busy(layoutRows[top].id, k) && !busy(layoutRows[bottom].id, k)) lamps.push({ x: rowX + k * SPACE_W, y });
+    }
+  }
+  for (let k = 4; k < t.stalls; k += 8) {
+    if (!busy(layoutRows[rows.length - 1].id, k)) lamps.push({ x: rowX + k * SPACE_W, y: lastRow.y + SPACE_D / 2 });
+  }
+
+  const islands = [];
+  for (const [top, bottom] of pairs) {
+    const y = rows[top].y;
+    const h = rows[bottom].y + SPACE_D - y;
+    islands.push({ x: rowX - 40, y, w: 40, h }, { x: rowX + rowW, y, w: 40, h });
+  }
+  islands.push({ x: rowX - 40, y: lastRow.y, w: 40, h: SPACE_D }, { x: rowX + rowW, y: lastRow.y, w: 40, h: SPACE_D });
+
+  // Storefront: doors, the GROCERY sign over the center, the return board
+  // beside it, and windows wherever the wall is clear.
+  const doors = { x: t.doorsX, y: storeH - 16, w: t.doorsW, h: 16 };
+  const signX = width / 2;
+  const boardX = signX + 114;
+  const blocked = [[doors.x - 30, doors.x + doors.w + 30], [signX - 115, signX + 115], [boardX - 10, boardX + 110]].sort((a, b) => a[0] - b[0]);
+  const windows = [];
+  let cursor = 20;
+  for (const [b0, b1] of [...blocked, [width - 20, width]]) {
+    for (let x = cursor; b0 - x >= 36;) {
+      const w = Math.min(200, b0 - x);
+      windows.push([x, x + w]);
+      x += w + 30;
+    }
+    cursor = Math.max(cursor, b1);
+  }
+
+  const corral = { x: t.corralX, y: storeH + 4, w: 160, h: 60 };
+  const doorsCx = doors.x + doors.w / 2;
+  const curbSpots = [];
+  for (let x = 110; x < width - 60; x += 150) {
+    if (Math.abs(x - doorsCx) < 100 || (x > corral.x - 40 && x < corral.x + corral.w + 40)) continue;
+    curbSpots.push({ x, y: storeH + 50 });
+  }
+  const acc = Math.max(0, Math.min(t.stalls - 2, Math.floor((doorsCx - rowX) / SPACE_W)));
+
+  // Lanes. Left and right edges are chains of nodes sorted by height.
+  const [x1, x2] = t.gateX;
+  const nodes = {
+    FW: { x: 28, y: fireY }, FE: { x: RX, y: fireY },
+    Lin: { x: 28, y: aisles[0] + 70 }, Rout: { x: RX, y: aisles[0] + 70 },
+    BW: { x: 28, y: botY }, BE: { x: RX, y: botY },
+    B1i: { x: x1, y: botY }, B1x: { x: x1 - 60, y: botY },
+    B2i: { x: x2, y: botY }, B2x: { x: x2 - 60, y: botY },
+    GWi: { x: -40, y: aisles[0] + 70 }, GWo: { x: -40, y: aisles[0] },
+    GEi: { x: width + 40, y: aisles[0] }, GEo: { x: width + 40, y: aisles[0] + 70 },
+    GS1i: { x: x1, y: height + 40 }, GS1o: { x: x1 - 60, y: height + 40 },
+    GS2i: { x: x2, y: height + 40 }, GS2o: { x: x2 - 60, y: height + 40 },
+  };
+  aisles.forEach((y, i) => {
+    nodes[`A${i + 1}W`] = { x: 28, y };
+    nodes[`A${i + 1}E`] = { x: RX, y };
+  });
+  const sideIds = (prefix, extra) => Object.keys(nodes).filter((id) => nodes[id].x === (prefix === 'L' ? 28 : RX) && (/^A\d+[WE]$/.test(id) || extra.includes(id)));
+  const right = sideIds('R', ['FE', 'Rout', 'BE']).sort((a, b) => nodes[a].y - nodes[b].y); // southbound
+  const left = sideIds('L', ['FW', 'Lin', 'BW']).sort((a, b) => nodes[b].y - nodes[a].y); // northbound
+  const chain = (ids) => ids.slice(1).map((id, i) => [ids[i], id]);
+  const edges = [
+    ['FW', 'FE'],
+    ...chain(right),
+    ...chain(['BE', 'B2i', 'B2x', 'B1i', 'B1x', 'BW']),
+    ...chain(left),
+    ...aisles.map((_, i) => [`A${i + 1}E`, `A${i + 1}W`]),
+    ['GWi', 'Lin'], ['A1W', 'GWo'], ['GEi', 'A1E'], ['Rout', 'GEo'],
+    ['GS1i', 'B1i'], ['B1x', 'GS1o'], ['GS2i', 'B2i'], ['B2x', 'GS2o'],
+  ];
+
+  return {
+    name: t.name,
+    world: { w: width, h: height },
+    store: { rect: { x: 0, y: 0, w: width, h: storeH }, doors, signX, boardX, windows },
+    sidewalk: { x: 0, y: storeH, w: width, h: 64 },
+    asphalt: { x: 0, y: storeH + 60, w: width, h: height - storeH - 60 },
+    corral,
+    rows: layoutRows,
+    bins,
+    islands,
+    lamps,
+    painted,
+    accessible: [`A${acc}`, `A${acc + 1}`],
+    lanes: {
+      nodes,
+      edges,
+      gates: [
+        { label: 'W', in: 'GWi', out: 'GWo', side: 'left' },
+        { label: 'E', in: 'GEi', out: 'GEo', side: 'right' },
+        { label: 'S1', in: 'GS1i', out: 'GS1o', side: 'bottom' },
+        { label: 'S2', in: 'GS2i', out: 'GS2o', side: 'bottom' },
+      ],
+    },
+    curbSpots,
+    playerStart: { x: corral.x + corral.w / 2, y: rows[0].y + 49 },
+  };
+}
+
+// The five chapters: one map each, five levels each.
+const CHAPTERS = [
+  { name: 'Corner Store', layout: LAYOUTS.classic },
+  {
+    name: 'Strip Mall',
+    layout: expandTemplate({
+      name: 'Strip Mall', stalls: 24, rows: 3, storeH: 104, doorsX: 330, doorsW: 104, corralX: 592,
+      bins: [{ row: 'C', stall: 3 }, { row: 'C', stall: 20 }], gateX: [360, 1000],
+    }),
+  },
+  {
+    name: 'Supermarket',
+    layout: expandTemplate({
+      name: 'Supermarket', stalls: 28, rows: 5, storeH: 120, doorsX: 420, doorsW: 112, corralX: 688,
+      gaps: [[13, 14]], bins: [{ row: 'C', stall: 3 }, { row: 'E', stall: 16 }, { row: 'B', stall: 23 }], gateX: [380, 1160],
+    }),
+  },
+  {
+    name: 'Supercenter',
+    layout: expandTemplate({
+      name: 'Supercenter', stalls: 36, rows: 7, storeH: 136, doorsX: 560, doorsW: 120, corralX: 880,
+      gaps: [[17, 18]], bins: [{ row: 'C', stall: 4 }, { row: 'E', stall: 28 }, { row: 'G', stall: 10 }, { row: 'A', stall: 33 }],
+      gateX: [500, 1500],
+    }),
+  },
+  {
+    name: 'Warehouse',
+    layout: expandTemplate({
+      name: 'Warehouse', stalls: 44, rows: 9, storeH: 152, doorsX: 640, doorsW: 128, corralX: 1072,
+      gaps: [[14, 15], [29, 30]], overflow: { pair: 4, gap: 48 },
+      bins: [{ row: 'A', stall: 40 }, { row: 'C', stall: 6 }, { row: 'E', stall: 22 }, { row: 'G', stall: 36 }, { row: 'I', stall: 10 }],
+      gateX: [520, 1800],
+    }),
+  },
+];
+
+// ---- Levels -----------------------------------------------------------------
+//
+// One row per level. Inside a chapter, level 1 is the quietest (fewest cars
+// and shoppers) and level 5 the busiest. Par rises 60 a level and dips 60 at
+// each new chapter, so the bigger map is the difficulty spike. (Par was cut
+// 40% across the board so levels are easy to pass: the game should be fun,
+// not a chore.) Tune here.
+//
+//   cars        moving cars at once        arrive  seconds between arrivals
+//   shoppers    shoppers out at once       exit    seconds between shoppers leaving the store
+//   strays      strays out at once (and at the start)
+//   fill        share of stalls with a parked car at the start
+//   par         score for 100%; C (70% of par) or better unlocks the next level
+//   seed        fixes the starting layout: same level, same start every time
+const LEVEL_ROWS = [
+  // lvl ch st cars arrive    shoppers exit      strays fill  par   seed
+  [1, 1, 1, 1, [8, 13], 2, [10, 15], 2, 0.35, 780, 1101],
+  [2, 1, 2, 1, [7, 12], 3, [8, 13], 2, 0.42, 840, 1202],
+  [3, 1, 3, 2, [6, 10], 4, [7, 11], 3, 0.5, 900, 1303],
+  [4, 1, 4, 2, [5, 9], 5, [5, 9], 3, 0.55, 960, 1404],
+  [5, 1, 5, 3, [4, 8], 6, [4, 8], 3, 0.6, 1020, 1505],
+  [6, 2, 1, 2, [7, 12], 3, [9, 14], 3, 0.4, 960, 2106],
+  [7, 2, 2, 2, [6, 11], 4, [8, 12], 3, 0.45, 1020, 2207],
+  [8, 2, 3, 3, [5, 9], 5, [6, 10], 4, 0.5, 1080, 2308],
+  [9, 2, 4, 3, [4, 8], 6, [5, 9], 4, 0.56, 1140, 2409],
+  [10, 2, 5, 4, [4, 7], 7, [4, 7], 4, 0.62, 1200, 2510],
+  [11, 3, 1, 2, [6, 11], 4, [8, 12], 4, 0.4, 1140, 3111],
+  [12, 3, 2, 3, [5, 10], 5, [7, 11], 4, 0.45, 1200, 3212],
+  [13, 3, 3, 3, [5, 9], 6, [6, 10], 5, 0.5, 1260, 3313],
+  [14, 3, 4, 4, [4, 8], 7, [5, 8], 5, 0.55, 1320, 3414],
+  [15, 3, 5, 4, [3, 7], 8, [4, 7], 5, 0.6, 1380, 3515],
+  [16, 4, 1, 3, [5, 10], 5, [7, 11], 5, 0.4, 1320, 4116],
+  [17, 4, 2, 3, [5, 9], 6, [6, 10], 5, 0.45, 1380, 4217],
+  [18, 4, 3, 4, [4, 8], 7, [5, 9], 6, 0.5, 1440, 4318],
+  [19, 4, 4, 5, [3, 7], 8, [4, 8], 6, 0.55, 1500, 4419],
+  [20, 4, 5, 5, [3, 6], 10, [3, 6], 6, 0.6, 1560, 4520],
+  [21, 5, 1, 3, [5, 9], 6, [6, 10], 6, 0.4, 1500, 5121],
+  [22, 5, 2, 4, [4, 8], 7, [5, 9], 6, 0.45, 1560, 5222],
+  [23, 5, 3, 5, [4, 7], 9, [4, 8], 7, 0.5, 1620, 5323],
+  [24, 5, 4, 5, [3, 6], 10, [3, 7], 7, 0.55, 1680, 5424],
+  [25, 5, 5, 6, [2, 5], 12, [3, 6], 8, 0.6, 1740, 5525],
+];
+const LEVELS = LEVEL_ROWS.map(([level, chapter, stage, cars, arriveEvery, shoppers, exitEvery, strays, fill, par, seed]) => ({
+  level, chapter, stage, cars, arriveEvery, shoppers, exitEvery, strays, fill, par, seed,
+}));
+
+// What a level looks like, for menus and checks: world size and counts from its map.
+function levelInfo(n) {
+  const lv = LEVELS[n - 1];
+  const layout = CHAPTERS[lv.chapter - 1].layout;
+  const lot = buildLot(layout);
+  return {
+    ...lv,
+    chapterName: CHAPTERS[lv.chapter - 1].name,
+    worldWidth: lot.width,
+    worldHeight: lot.height,
+    rowCount: lot.rows.length,
+    stallCount: lot.spaces.length,
+    binCount: lot.bins.length,
+  };
+}
+
+let LEVEL = LEVELS[0];
+let LOT = buildLot(CHAPTERS[0].layout);
+
+// Parked-car targets for the current level: how many at the start, and the
+// range traffic keeps the lot in.
+function parkedTargets() {
+  const stalls = LOT.spaces.length;
+  const start = Math.round(LEVEL.fill * stalls);
+  return { start, min: Math.round(start * 0.7), max: Math.round(Math.min(0.85, LEVEL.fill + 0.2) * stalls) };
+}
+
+// Seeded random numbers (mulberry32), so a level's starting layout repeats.
+// `rng` is Math.random during play and the level's seeded stream while a
+// shift is being set up.
+function seededRandom(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+let rng = Math.random;
 
 // Shortest path over the one-way lane graph. `extra` adds a temporary node
 // (a space's turn-in point) splitting one lane edge.
 function findRoute(from, to, extra) {
-  const nodes = { ...LANE_NODES };
-  let edges = LANE_EDGES;
+  const nodes = { ...LOT.lanes.nodes };
+  let edges = LOT.lanes.edges;
   if (extra) {
     nodes[extra.id] = extra.point;
     const [u, v] = extra.lane;
@@ -274,8 +637,8 @@ function findRoute(from, to, extra) {
 
 function makePlayer() {
   return {
-    x: 471,
-    y: 240,
+    x: LOT.playerStart.x - 9,
+    y: LOT.playerStart.y - 9,
     w: 18,
     h: 18,
     facingX: 0,
@@ -294,7 +657,7 @@ function makePlayer() {
 }
 
 function randBetween([lo, hi]) {
-  return lo + Math.random() * (hi - lo);
+  return lo + rng() * (hi - lo);
 }
 
 // Saved between visits: best score, best combo, and the mute setting.
@@ -302,8 +665,27 @@ function randBetween([lo, hi]) {
 // the game then just plays without saving.
 const STORE_KEY = 'lotRunner.v1';
 
+// Also kept: Story progress (highest unlocked level, whether the story is
+// finished) and the best score and grade per level, separately for Story and
+// Free Play. Free Play never unlocks anything.
+function cleanBests(raw) {
+  const bests = {};
+  if (!raw || typeof raw !== 'object') return bests;
+  for (let n = 1; n <= LEVELS.length; n++) {
+    const b = raw[n];
+    if (b && Number.isFinite(b.score) && /^[A-F]$/.test(b.grade)) bests[n] = { score: Math.max(0, b.score), grade: b.grade };
+  }
+  return bests;
+}
+
 function loadSaved() {
-  const saved = { highScore: 0, bestComboLevel: 0, muted: false };
+  const saved = {
+    highScore: 0,
+    bestComboLevel: 0,
+    muted: false,
+    story: { unlocked: 1, completed: false, bests: {} },
+    free: { bests: {} },
+  };
   try {
     const raw = JSON.parse(window.localStorage.getItem(STORE_KEY));
     if (raw && typeof raw === 'object') {
@@ -312,6 +694,12 @@ function loadSaved() {
         saved.bestComboLevel = Math.min(Math.max(0, raw.bestComboLevel), CONFIG.comboMults.length - 1);
       }
       saved.muted = raw.muted === true;
+      if (raw.story && typeof raw.story === 'object') {
+        if (Number.isInteger(raw.story.unlocked)) saved.story.unlocked = Math.min(Math.max(1, raw.story.unlocked), LEVELS.length);
+        saved.story.completed = raw.story.completed === true;
+        saved.story.bests = cleanBests(raw.story.bests);
+      }
+      if (raw.free && typeof raw.free === 'object') saved.free.bests = cleanBests(raw.free.bests);
     }
   } catch (e) {
     // Unreadable or unavailable storage: start fresh.
@@ -329,6 +717,10 @@ function persist() {
 
 const state = {
   debug: false,
+  level: 1, // current level number (LEVELS)
+  mode: 'free', // 'story' | 'free': how the current shift was started
+  selectMode: 'story', // which list the level-select screen is showing
+  result: null, // end-of-shift outcome: { passed, grade, newBest, unlockedNow, storyDone }
   // 'title' | 'howto' | 'countdown' | 'playing' | 'paused' | 'over'
   phase: 'title',
   countdown: 0, // seconds left of "3, 2, 1" before a shift starts
@@ -413,12 +805,16 @@ function makeCart(kind, x, y, angle, status) {
   return cart;
 }
 
+// Add a cart to the emptiest bin lane (first one on a tie). Null if every bin is full.
 function spawnCartInBin() {
   const counts = LOT.binLanes.map((_, i) => cartsInLane(i).length);
-  const lane = counts[0] <= counts[1] ? 0 : 1;
-  if (counts[lane] >= LOT.binDepth) return null;
-  // Basket points down into the bin, handle toward the aisle.
-  const cart = makeCart('standard', LOT.binLanes[lane].x, LOT.binSlotY(counts[lane]), Math.PI / 2, 'inBin');
+  let lane = -1;
+  LOT.binLanes.forEach((l, i) => {
+    if (counts[i] < l.depth && (lane < 0 || counts[i] < counts[lane])) lane = i;
+  });
+  if (lane < 0) return null;
+  const l = LOT.binLanes[lane];
+  const cart = makeCart('standard', l.x, l.slotY(counts[lane]), l.angle, 'inBin');
   cart.lane = lane;
   return cart;
 }
@@ -463,10 +859,21 @@ function spawnStray() {
     return d >= CONFIG.strayMinSpawnDist && !bodies.some((b) => overlaps(b, box));
   });
   if (open.length === 0) return null;
-  const spot = open[Math.floor(Math.random() * open.length)];
+  const spot = open[Math.floor(rng() * open.length)];
   // Strays are never parked neatly.
-  const jitter = (Math.random() - 0.5) * (spot.where === 'curb' ? Math.PI : 0.8);
+  const jitter = (rng() - 0.5) * (spot.where === 'curb' ? Math.PI : 0.8);
   return makeCart('stray', spot.x, spot.y, spot.angle + jitter, 'loose');
+}
+
+// Switch to level n (1-25): its chapter's map and its traffic, shopper and
+// stray settings, then start a fresh shift there.
+function loadLevel(n, mode = state.mode) {
+  LEVEL = LEVELS[Math.max(1, Math.min(LEVELS.length, n)) - 1];
+  state.level = LEVEL.level;
+  state.mode = mode;
+  LOT = buildLot(CHAPTERS[LEVEL.chapter - 1].layout);
+  rebuildPedGrid();
+  resetSession();
 }
 
 // Start a fresh shift.
@@ -485,7 +892,10 @@ function resetSession() {
   state.reserved = new Set();
   state.traffic = [];
   state.nextCarId = 1;
-  state.arriveTimer = randBetween(CONFIG.arriveEvery);
+  // Everything set up here comes from the level's seed, so a replay starts the same.
+  rng = seededRandom(LEVEL.seed);
+  recentStyles = [];
+  state.arriveTimer = randBetween(LEVEL.arriveEvery);
   state.shoppers = [];
   state.nextShopperId = 1;
   state.shopperTimer = 2;
@@ -496,16 +906,17 @@ function resetSession() {
   // A random lot to start: fill spaces the player isn't standing in. Each
   // car's shopper is already inside the store.
   const open = LOT.spaces.filter((s) => spaceClear(s));
-  for (let i = 0; i < CONFIG.parkedStart && open.length; i++) {
-    const s = open.splice(Math.floor(Math.random() * open.length), 1)[0];
+  for (let i = 0; i < parkedTargets().start && open.length; i++) {
+    const s = open.splice(Math.floor(rng() * open.length), 1)[0];
     state.parked.set(s.id, {
-      color: CAR_COLORS[Math.floor(Math.random() * CAR_COLORS.length)],
+      color: CAR_COLORS[Math.floor(rng() * CAR_COLORS.length)],
       look: makeLook(),
       ownerInside: true,
     });
   }
-  for (let i = 0; i < BIN_CAPACITY; i++) spawnCartInBin();
-  for (let i = 0; i < CONFIG.strayMax; i++) spawnStray();
+  for (let i = 0; i < LOT.binCapacity; i++) spawnCartInBin();
+  for (let i = 0; i < LEVEL.strays; i++) spawnStray();
+  rng = Math.random;
 
   // Hold everything for "3, 2, 1, GO" before the clock starts.
   setPhase('countdown');
@@ -560,8 +971,8 @@ const KEY_TO_PLAY_ACTION = {
 
 // Keys on the title, how-to, pause and end screens.
 const KEY_TO_MENU_ACTION = {
-  ArrowUp: 'menuPrev', KeyW: 'menuPrev', ArrowLeft: 'menuPrev', KeyA: 'menuPrev',
-  ArrowDown: 'menuNext', KeyS: 'menuNext', ArrowRight: 'menuNext', KeyD: 'menuNext',
+  ArrowUp: 'menuUp', KeyW: 'menuUp', ArrowLeft: 'menuPrev', KeyA: 'menuPrev',
+  ArrowDown: 'menuDown', KeyS: 'menuDown', ArrowRight: 'menuNext', KeyD: 'menuNext',
   Enter: 'menuSelect', Space: 'menuSelect', KeyE: 'menuSelect',
 };
 
@@ -598,8 +1009,35 @@ function pressAction(action, source = 'keyboard') {
   }
 
   // Screen changes
-  if (action === 'play' || (action === 'restart' && phase !== 'title' && phase !== 'howto')) {
-    resetSession();
+  const inShift = phase === 'countdown' || phase === 'playing' || phase === 'paused' || phase === 'over';
+  if (action === 'replay' || (action === 'restart' && inShift)) {
+    loadLevel(LEVEL.level, state.mode);
+    return;
+  }
+  if (action === 'next') {
+    loadLevel(Math.min(LEVELS.length, LEVEL.level + 1), state.mode);
+    return;
+  }
+  if (action === 'modes') return setPhase('mode');
+  if ((action === 'story' || action === 'free') && phase === 'mode') {
+    state.selectMode = action;
+    setPhase('levels');
+    state.menuFocus = action === 'story' ? state.saved.story.unlocked - 1 : 0;
+    return;
+  }
+  if (action === 'levels') {
+    state.selectMode = state.mode;
+    setPhase('levels');
+    state.menuFocus = LEVEL.level - 1;
+    return;
+  }
+  if (action.startsWith('level:')) {
+    const n = Number(action.slice(6));
+    if (state.selectMode === 'story' && n > state.saved.story.unlocked) {
+      fx.lockedTap = { n, t: 0.5 }; // locked: give it a little shake
+      return;
+    }
+    loadLevel(n, state.selectMode);
     return;
   }
   if (action === 'howto' && phase === 'title') return setPhase('howto');
@@ -609,12 +1047,23 @@ function pressAction(action, source = 'keyboard') {
   if (action === 'escape') {
     if (phase === 'playing') setPhase('paused');
     else if (phase === 'paused') setPhase('playing');
-    else if (phase === 'howto') setPhase('title');
+    else if (phase === 'howto' || phase === 'mode') setPhase('title');
+    else if (phase === 'levels') setPhase('mode');
+    else if (phase === 'complete') pressAction('levels', source);
     return;
   }
 
-  // Menu navigation
+  // Menu navigation. On the level grid, up/down move a whole chapter row.
   const buttons = menuButtons();
+  if ((action === 'menuUp' || action === 'menuDown') && phase === 'levels') {
+    const f = state.menuFocus;
+    const grid = LEVELS.length;
+    if (action === 'menuDown') state.menuFocus = f >= grid ? f : f + 5 < grid ? f + 5 : grid;
+    else state.menuFocus = f >= grid ? grid - 3 : f - 5 >= 0 ? f - 5 : f;
+    return;
+  }
+  if (action === 'menuUp') action = 'menuPrev';
+  if (action === 'menuDown') action = 'menuNext';
   if (action === 'menuPrev' || action === 'menuNext') {
     if (buttons.length) {
       const step = action === 'menuNext' ? 1 : -1;
@@ -634,6 +1083,8 @@ function pressAction(action, source = 'keyboard') {
   else if (action === 'dropLast') dropLast();
 }
 
+const LEVEL_GRID_Y = 72; // top of the first chapter row on the level-select screen
+
 // Buttons on the current menu screen, in logical canvas units. Used to draw
 // them, to hit-test taps and clicks, and for keyboard focus.
 function menuButtons() {
@@ -641,8 +1092,35 @@ function menuButtons() {
   switch (state.phase) {
     case 'title':
       return [
-        { label: 'Play', action: 'play', x: bx, y: 262, w: bw, h: bh },
+        { label: 'Play', action: 'modes', primary: true, x: bx, y: 262, w: bw, h: bh },
         { label: 'How to Play', action: 'howto', x: bx, y: 328, w: bw, h: bh },
+      ];
+    case 'mode':
+      return [
+        { label: 'Story', action: 'story', primary: true, x: bx, y: 190, w: bw, h: bh },
+        { label: 'Free Play', action: 'free', x: bx, y: 290, w: bw, h: bh },
+        { label: 'Back', action: 'title', x: W / 2 - 90, y: 390, w: 180, h: 44 },
+      ];
+    case 'levels': {
+      // 5 chapter rows x 5 levels, then Back
+      const out = [];
+      for (let c = 0; c < CHAPTERS.length; c++) {
+        for (let st = 0; st < 5; st++) {
+          const n = c * 5 + st + 1;
+          out.push({
+            kind: 'level', level: n, label: String(n), action: `level:${n}`,
+            x: 404 + st * 88, y: LEVEL_GRID_Y + c * 78 + 8, w: 76, h: 50,
+            locked: state.selectMode === 'story' && n > state.saved.story.unlocked,
+          });
+        }
+      }
+      out.push({ label: 'Back', action: 'modes', x: W / 2 - 80, y: 478, w: 160, h: 44 });
+      return out;
+    }
+    case 'complete':
+      return [
+        { label: 'Levels', action: 'levels', primary: true, x: W / 2 - 166, y: 378, w: 160, h: 50 },
+        { label: 'Title', action: 'title', x: W / 2 + 6, y: 378, w: 160, h: 50 },
       ];
     case 'howto':
       return [{ label: 'Back', action: 'title', x: bx, y: 440, w: bw, h: bh }];
@@ -652,11 +1130,23 @@ function menuButtons() {
         { label: 'Restart shift', action: 'restart', x: bx, y: 272, w: bw, h: bh },
         { label: 'Quit to title', action: 'title', x: bx, y: 338, w: bw, h: bh },
       ];
-    case 'over':
-      return [
-        { label: 'Play again', action: 'play', x: W / 2 - 166, y: 424, w: 160, h: 46 },
-        { label: 'Title', action: 'title', x: W / 2 + 6, y: 424, w: 160, h: 46 },
-      ];
+    case 'over': {
+      // Story: on to the next level if this shift passed, else retry.
+      // Free Play: replay, next level, or back to the level list.
+      const r = state.result || {};
+      const hasNext = LEVEL.level < LEVELS.length;
+      let list;
+      if (state.mode === 'story') {
+        list = r.passed
+          ? [...(hasNext ? [['Next level', 'next']] : []), ['Replay', 'replay'], ['Levels', 'levels']]
+          : [['Retry', 'replay'], ['Levels', 'levels']];
+      } else {
+        list = [['Replay', 'replay'], ...(hasNext ? [['Next level', 'next']] : []), ['Level select', 'levels']];
+      }
+      const w = 150, gap = 12;
+      const x0 = W / 2 - (list.length * w + (list.length - 1) * gap) / 2;
+      return list.map(([label, action], i) => ({ label, action, primary: i === 0, x: x0 + i * (w + gap), y: 424, w, h: 46 }));
+    }
     default:
       return [];
   }
@@ -922,6 +1412,13 @@ const sfx = (() => {
     tick: (urgent) => play(urgent ? 'tickUrgent' : 'tick', () => {
       tone('square', urgent ? 1320 : 880, 0, urgent ? 0.07 : 0.04, urgent ? 0.14 : 0.08);
     }),
+    // Story complete: a rising arpeggio and a big bright chord.
+    fanfare: () => play('fanfare', () => {
+      [523, 659, 784, 1047].forEach((f, i) => tone('triangle', f, i * 0.12, 0.22, 0.3));
+      [523, 659, 784, 1047].forEach((f) => tone('square', f, 0.55, 0.9, 0.05));
+      [784, 988, 1175, 1568].forEach((f, i) => tone('triangle', f, 1.2 + i * 0.1, 0.25, 0.25));
+      [784, 988, 1175, 1568].forEach((f) => tone('sine', f, 1.65, 1.1, 0.12));
+    }),
     // Shift over: three falling notes.
     shiftOver: () => play('shiftOver', () => {
       tone('triangle', 659, 0, 0.26, 0.3);
@@ -977,7 +1474,7 @@ function worldSolids() {
 }
 
 function hitsWorld(b, blockers = worldSolids()) {
-  if (b.x < 0 || b.y < 0 || b.x + b.w > W || b.y + b.h > H) return true;
+  if (b.x < 0 || b.y < 0 || b.x + b.w > LOT.width || b.y + b.h > LOT.height) return true;
   return blockers.some((s) => overlaps(b, s));
 }
 
@@ -1018,7 +1515,7 @@ function comboMult() {
 // Whole-number percent of par, so 89.6% reads and grades as 89%, not a
 // rounded-up A. It can go past 100.
 function scorePercent(score) {
-  return Math.floor((score / CONFIG.parScore) * 100);
+  return Math.floor((score / LEVEL.par) * 100);
 }
 
 function gradeFor(score) {
@@ -1205,7 +1702,7 @@ function dockTrain() {
 function shiftAxis(bodies, axis, d, blockers) {
   if (d === 0) return;
   const size = axis === 'x' ? 'w' : 'h';
-  const limit = axis === 'x' ? W : H;
+  const limit = axis === 'x' ? LOT.width : LOT.height;
   const already = bodies.map((b) => new Set(blockers.filter((s) => overlaps(b, s))));
   for (const b of bodies) b[axis] += d;
 
@@ -1326,9 +1823,10 @@ function updatePlayer(dt) {
 function updateBin(dt) {
   const movers = [state.player, ...trainCarts()];
   LOT.binLanes.forEach((lane, i) => {
-    const carts = cartsInLane(i).sort((a, b) => a.y - b.y);
+    // Nearest the open end first
+    const carts = cartsInLane(i).sort((a, b) => (lane.openUp ? a.y - b.y : b.y - a.y));
     carts.forEach((cart, k) => {
-      const ty = LOT.binSlotY(k);
+      const ty = lane.slotY(k);
       const step = CONFIG.binCartSpeed * dt;
       const ny = cart.y > ty ? Math.max(ty, cart.y - step) : Math.min(ty, cart.y + step);
       const next = { x: lane.x, y: ny, w: cart.w, h: cart.h };
@@ -1347,11 +1845,12 @@ function updateBin(dt) {
 function spawnArrival() {
   const moving = state.traffic.length;
   const taken = state.parked.size + state.reserved.size;
-  if (moving >= CONFIG.trafficMaxMoving || taken >= CONFIG.parkedMax) return null;
+  if (moving >= LEVEL.cars || taken >= parkedTargets().max) return null;
   const free = LOT.spaces.filter(spaceFree);
   if (free.length === 0) return null;
   const space = free[Math.floor(Math.random() * free.length)];
-  const gate = GATES[Math.floor(Math.random() * GATES.length)];
+  const gates = LOT.lanes.gates;
+  const gate = gates[Math.floor(Math.random() * gates.length)];
   const path = findRoute(gate.in, 'SPOT', { id: 'SPOT', point: space.aisle, lane: space.lane });
   if (!path) return null;
   state.reserved.add(space.id);
@@ -1369,7 +1868,7 @@ function spawnArrival() {
 // A parked car backs out and drives off to a random entrance. Called when
 // its shopper has climbed in.
 function spawnDeparture(id) {
-  if (state.traffic.length >= CONFIG.trafficMaxMoving || !state.parked.has(id)) return null;
+  if (state.traffic.length >= LEVEL.cars || !state.parked.has(id)) return null;
   const space = LOT.spaceById[id];
   const { color } = state.parked.get(id);
   state.parked.delete(id);
@@ -1384,7 +1883,8 @@ function spawnDeparture(id) {
 }
 
 function routeToExit(car, space) {
-  const gate = GATES[Math.floor(Math.random() * GATES.length)];
+  const gates = LOT.lanes.gates;
+  const gate = gates[Math.floor(Math.random() * gates.length)];
   car.path = findRoute('SPOT', gate.out, { id: 'SPOT', point: space.aisle, lane: space.lane });
   car.idx = 1;
   car.mode = 'toExit';
@@ -1562,10 +2062,10 @@ function updateVehicles(dt) {
   state.arriveTimer -= dt;
   if (state.arriveTimer <= 0) {
     spawnArrival();
-    state.arriveTimer = randBetween(CONFIG.arriveEvery);
+    state.arriveTimer = randBetween(LEVEL.arriveEvery);
   }
   // Cars whose shopper is back inside pull out as soon as traffic allows.
-  while (state.pendingDepart.length && state.traffic.length < CONFIG.trafficMaxMoving) {
+  while (state.pendingDepart.length && state.traffic.length < LEVEL.cars) {
     spawnDeparture(state.pendingDepart.shift());
   }
 }
@@ -1587,7 +2087,7 @@ let recentStyles = [];
 
 // A random shopper, avoiding the last few hair styles so a crowd stays varied.
 function makeLook() {
-  const pick = (list) => list[Math.floor(Math.random() * list.length)];
+  const pick = (list) => list[Math.floor(rng() * list.length)];
   const styles = SHOPPER_LOOK.styles.filter((s) => !recentStyles.includes(s));
   const style = pick(styles);
   recentStyles = [...recentStyles, style].slice(-3);
@@ -1597,29 +2097,42 @@ function makeLook() {
     top: pick(SHOPPER_LOOK.tops),
     accent: pick(SHOPPER_LOOK.tops),
     style,
-    glasses: Math.random() < 0.3,
-    tote: Math.random() < 0.45,
-    height: 0.9 + Math.random() * 0.22,
-    girth: 0.9 + Math.random() * 0.3,
+    glasses: rng() < 0.3,
+    tote: rng() < 0.45,
+    height: 0.9 + rng() * 0.22,
+    girth: 0.9 + rng() * 0.3,
   };
 }
 
-const DOOR_POINT = { x: LOT.doors.x + LOT.doors.w / 2, y: 110 };
-// One drop-off in front of each bin lane, so returning shoppers don't queue on one spot.
-const BIN_MOUTHS = LOT.binLanes.map((lane) => ({ x: lane.x + CART_SIZE / 2, y: LOT.bin.y - 16 }));
-const HANDOFF_RADIUS = 24; // close enough to the bin or corral to hand a cart over
+// Shoppers only ever return carts to a bin, where the player picks carts up,
+// never to the corral. Each bin lane has its own drop-off just inside the
+// opening (out of the driving lane; see buildLot), so they don't queue on one spot.
+const HANDOFF_RADIUS = 18; // close enough to the bin opening to hand a cart over
 const SHOPPER_PATIENCE = 8; // seconds stuck before a shopper gives up and leaves their cart
 
 function binMouthFor(from) {
   const busy = (m) => state.shoppers.filter((o) => o.goal === m).length;
-  return [...BIN_MOUTHS].sort((a, b) => busy(a) - busy(b) || Math.hypot(a.x - from.x, a.y - from.y) - Math.hypot(b.x - from.x, b.y - from.y))[0];
+  return LOT.binLanes.map((l) => l.mouth).sort((a, b) => busy(a) - busy(b) || Math.hypot(a.x - from.x, a.y - from.y) - Math.hypot(b.x - from.x, b.y - from.y))[0];
 }
-const CORRAL_MOUTH = { x: LOT.returnZone.x + LOT.returnZone.w / 2, y: LOT.corral.y + LOT.corral.h + 14 };
-
-// Where a driver gets in or out: the open end of their space.
+// Where a driver gets in or out: just inside the open end of their space,
+// clear of the driving lane in front of it.
 function boardingPoint(space) {
-  const dir = space.pullAngle > 0 ? -1 : 1; // pulled in heading down -> the open end is up
-  return { x: space.center.x, y: space.center.y + dir * (SPACE_D / 2 + 6) };
+  const openUp = space.pullAngle > 0; // pulled in heading down -> the open end is up
+  return { x: space.center.x, y: openUp ? space.rect.y + 5 : space.rect.y + space.rect.h - 5 };
+}
+
+// In the strips cars drive along? A shopper held up while standing in one
+// moves on quickly instead of holding up traffic.
+function inLane(box) {
+  return LOT.laneBands.some((b) => overlaps(box, b));
+}
+
+// The patch of road each moving car is about to drive onto.
+function carFronts() {
+  return movingVehicles().filter(wantsToMove).map((v) => {
+    const a = motionAngle(v);
+    return vehicleBox(v, v.cx + Math.cos(a) * 30, v.cy + Math.sin(a) * 30);
+  });
 }
 
 function shopperBox(sh) {
@@ -1646,9 +2159,11 @@ function cartPusherBoxes() {
 // ---- Walking routes: A* over a 10px grid around the lot's solids ----------
 
 const PED_CELL = 10;
-const PED_COLS = Math.ceil(W / PED_CELL);
-const PED_ROWS = Math.ceil(H / PED_CELL);
 const PED_PAD = 9; // keep this far from solids, so a pushed cart clears them too
+// Grid size and the never-changing blocked cells, rebuilt whenever the lot changes.
+let PED_COLS = 0;
+let PED_ROWS = 0;
+let PED_STATIC = null;
 
 function markBlocked(grid, r, pad) {
   const c0 = Math.max(0, Math.floor((r.x - pad) / PED_CELL));
@@ -1658,14 +2173,17 @@ function markBlocked(grid, r, pad) {
   for (let row = r0; row <= r1; row++) for (let col = c0; col <= c1; col++) grid[row * PED_COLS + col] = 1;
 }
 
-const PED_STATIC = (() => {
+function rebuildPedGrid() {
+  PED_COLS = Math.ceil(LOT.width / PED_CELL);
+  PED_ROWS = Math.ceil(LOT.height / PED_CELL);
   const grid = new Uint8Array(PED_COLS * PED_ROWS);
   for (const s of LOT.staticSolids) markBlocked(grid, s, PED_PAD);
-  // Walkers stay off the store wall and out of the bin and corral
-  markBlocked(grid, LOT.bin, 2);
+  // Walkers stay off the store wall and out of the bins and corral
+  for (const bin of LOT.bins) markBlocked(grid, bin.rect, 2);
   markBlocked(grid, LOT.returnZone, 2);
-  return grid;
-})();
+  PED_STATIC = grid;
+}
+rebuildPedGrid();
 
 function cellOf(pt) {
   return {
@@ -1808,14 +2326,15 @@ function makeShopper(look, from, mode, extra = {}) {
     y: from.y,
     fx: 0,
     fy: 1,
-    mode, // 'toStore' | 'toBin' | 'toCorral' | 'toCar'
+    mode, // 'toStore' | 'toBin' | 'toCar'
     path: null,
     idx: 1,
     goal: null,
     cartId: null,
     space: null,
     abandon: false,
-    wait: 0,
+    wait: 0, // seconds held up right now (resets once they move)
+    sinceReplan: 0, // seconds since they last looked for a way around
     stuck: 0, // total seconds held up this leg
     walked: 0, // distance, drives the waddle
     moving: false,
@@ -1829,8 +2348,12 @@ function setGoal(sh, goal, extra = []) {
   sh.goal = goal;
   sh.path = planWalk({ x: sh.x, y: sh.y }, goal, extra);
   sh.idx = 1;
-  sh.wait = 0;
-  if (!extra.length) sh.stuck = 0; // a fresh leg, not a detour
+  sh.sinceReplan = 0;
+  if (!extra.length) {
+    // a fresh leg, not a detour
+    sh.stuck = 0;
+    sh.wait = 0;
+  }
   return !!sh.path;
 }
 
@@ -1838,7 +2361,7 @@ function setGoal(sh, goal, extra = []) {
 function spawnShopperFromCar(spaceId) {
   const entry = state.parked.get(spaceId);
   const sh = makeShopper(entry.look, boardingPoint(LOT.spaceById[spaceId]), 'toStore', { space: spaceId });
-  if (!setGoal(sh, DOOR_POINT)) {
+  if (!setGoal(sh, LOT.doorPoint)) {
     state.shoppers = state.shoppers.filter((s) => s !== sh);
     entry.ownerInside = true;
   }
@@ -1846,21 +2369,21 @@ function spawnShopperFromCar(spaceId) {
 
 // A shopper comes out of the store pushing a cart, heading for their car.
 function spawnShopperFromStore() {
-  if (state.shoppers.length >= CONFIG.maxShoppers || state.parked.size <= CONFIG.parkedMin) return;
+  if (state.shoppers.length >= LEVEL.shoppers || state.parked.size <= parkedTargets().min) return;
   const ready = [...state.parked.entries()].filter(([, e]) => e.ownerInside && !e.leaving);
   if (!ready.length) return;
   const [spaceId, entry] = ready[Math.floor(Math.random() * ready.length)];
   // Don't pop a cart out on top of the player or another cart
-  const cartSpot = { x: DOOR_POINT.x - CART_SIZE / 2, y: DOOR_POINT.y + 17 - CART_SIZE / 2, w: CART_SIZE, h: CART_SIZE };
-  const busy = [state.player, ...state.carts, ...shopperBodies()].some((b) => overlaps(b, cartSpot) || overlaps(b, shopperBox(DOOR_POINT)));
+  const door = LOT.doorPoint;
+  const cartSpot = { x: door.x - CART_SIZE / 2, y: door.y + 17 - CART_SIZE / 2, w: CART_SIZE, h: CART_SIZE };
+  const busy = [state.player, ...state.carts, ...shopperBodies()].some((b) => overlaps(b, cartSpot) || overlaps(b, shopperBox(door)));
   if (busy) return;
 
   const abandon = Math.random() < CONFIG.abandonChance;
-  const binFull = state.carts.filter((c) => c.status === 'inBin').length >= BIN_CAPACITY;
-  const sh = makeShopper(entry.look, { ...DOOR_POINT }, abandon ? 'toCar' : binFull ? 'toCorral' : 'toBin', { space: spaceId, abandon });
+  const sh = makeShopper(entry.look, { ...door }, abandon ? 'toCar' : 'toBin', { space: spaceId, abandon });
   const cart = makeCart('standard', cartSpot.x, cartSpot.y, Math.PI / 2, 'shopper');
   sh.cartId = cart.id;
-  const goal = sh.mode === 'toCar' ? boardingPoint(LOT.spaceById[spaceId]) : sh.mode === 'toBin' ? binMouthFor(sh) : CORRAL_MOUTH;
+  const goal = sh.mode === 'toCar' ? boardingPoint(LOT.spaceById[spaceId]) : binMouthFor(sh);
   if (!setGoal(sh, goal)) {
     state.shoppers = state.shoppers.filter((s) => s !== sh);
     state.carts = state.carts.filter((c) => c !== cart);
@@ -1883,14 +2406,25 @@ function pushedCartAt(sh, x, y, fxd, fyd) {
 // train, a car or another shopper's cart?
 function shopperStepBlocked(sh, box, cartBox) {
   // People on foot can squeeze past each other; only a pushed cart is in the way.
-  const hard = [state.player, ...trainCarts(), ...vehicleBoxes()];
+  // A shopper who's been stuck in a driving lane for a second stops minding
+  // cars (which are all stopped for them anyway) and gets out of the road.
+  const hurry = sh.wait > 1 && inLane(shopperBox(sh));
+  const hard = [state.player, ...trainCarts(), ...(hurry ? [] : vehicleBoxes())];
   for (const o of state.shoppers) {
     if (o !== sh && o.cartId) hard.push(cartById(o.cartId));
   }
   const mine = [box, cartBox].filter(Boolean);
   const before = [shopperBox(sh), sh.cartId ? cartById(sh.cartId) : null].filter(Boolean);
-  // Something we already overlap (say, a cart we spawned next to) doesn't hold us up.
-  return hard.some((o) => mine.some((m) => overlaps(m, o)) && !before.some((b) => overlaps(b, o)));
+  const here = { x: sh.x, y: sh.y };
+  const next = center(box);
+  return hard.some((o) => {
+    if (!mine.some((m) => overlaps(m, o))) return false;
+    // Something we already overlap (say, a cart we spawned next to) doesn't hold us up.
+    if (before.some((b) => overlaps(b, o))) return false;
+    // Stepping away from it is always fine: only walking into it is blocked.
+    const oc = center(o);
+    return Math.hypot(next.x - oc.x, next.y - oc.y) < Math.hypot(here.x - oc.x, here.y - oc.y);
+  });
 }
 
 function finishLeg(sh) {
@@ -1901,11 +2435,15 @@ function finishLeg(sh) {
     sh.gone = true;
     return;
   }
-  if (sh.mode === 'toBin' || sh.mode === 'toCorral') {
-    // Cart returned: into the bin if there's room, otherwise it's put away at the corral.
+  if (sh.mode === 'toBin') {
+    // Cart returned to the bin. If the bin is full it's left loose right at
+    // the bin opening: still where the player picks carts up.
     state.carts = state.carts.filter((c) => c !== cart);
+    if (!spawnCartInBin()) {
+      cart.status = 'loose';
+      state.carts.push(cart);
+    }
     sh.cartId = null;
-    if (sh.mode === 'toBin') spawnCartInBin();
     sh.mode = 'toCar';
     if (!entry || !setGoal(sh, boardingPoint(LOT.spaceById[sh.space]))) sh.gone = true;
     return;
@@ -1933,8 +2471,8 @@ function updateShopper(sh, dt) {
     finishLeg(sh);
     return;
   }
-  // Returning a cart: close enough to the bin or corral counts.
-  if ((sh.mode === 'toBin' || sh.mode === 'toCorral') && Math.hypot(sh.goal.x - sh.x, sh.goal.y - sh.y) < HANDOFF_RADIUS) {
+  // Returning a cart: close enough to the bin opening counts.
+  if (sh.mode === 'toBin' && Math.hypot(sh.goal.x - sh.x, sh.goal.y - sh.y) < HANDOFF_RADIUS) {
     finishLeg(sh);
     return;
   }
@@ -1962,7 +2500,9 @@ function updateShopper(sh, dt) {
     // Wait, then try walking around whatever's in the way.
     sh.wait += dt;
     sh.stuck += dt;
-    if (sh.stuck > SHOPPER_PATIENCE && sh.cartId) {
+    sh.sinceReplan += dt;
+    const nearCorral = sh.cartId && pointIn(center(cartById(sh.cartId)), LOT.corralArea);
+    if (sh.stuck > SHOPPER_PATIENCE && sh.cartId && !nearCorral) {
       // Fed up: leave the cart right here and head for the car.
       const cart = cartById(sh.cartId);
       cart.status = 'loose';
@@ -1977,10 +2517,13 @@ function updateShopper(sh, dt) {
       finishLeg(sh);
       return;
     }
-    if (sh.wait > CONFIG.shopperReplanAfter) {
-      const around = [state.player, ...trainCarts(), ...vehicleBoxes()];
+    // Held up in a driving lane (or by a car): step around almost at once,
+    // steering clear of the road just in front of cars, so traffic keeps moving.
+    const inTheRoad = inLane(shopperBox(sh)) || (sh.cartId && inLane(cartById(sh.cartId)));
+    if (sh.sinceReplan > (inTheRoad ? 0.3 : CONFIG.shopperReplanAfter)) {
+      const around = [state.player, ...trainCarts(), ...vehicleBoxes(), ...carFronts()];
       for (const o of state.shoppers) if (o !== sh && o.cartId) around.push(shopperBox(o), cartById(o.cartId));
-      if (!setGoal(sh, sh.goal, around)) sh.wait = 0;
+      if (!setGoal(sh, sh.goal, around)) setGoal(sh, sh.goal);
     }
     return;
   }
@@ -2006,7 +2549,7 @@ function updateShoppers(dt) {
   state.shopperTimer -= dt;
   if (state.shopperTimer <= 0) {
     spawnShopperFromStore();
-    state.shopperTimer = randBetween(CONFIG.shopperExitEvery);
+    state.shopperTimer = randBetween(LEVEL.exitEvery);
   }
 }
 
@@ -2015,7 +2558,7 @@ function updateShoppers(dt) {
 // ---------------------------------------------------------------------------
 
 function updateStrays(dt) {
-  if (strayCount() >= CONFIG.strayMax) {
+  if (strayCount() >= LEVEL.strays) {
     state.strayTimer = CONFIG.strayRespawn;
     return;
   }
@@ -2065,7 +2608,11 @@ function updateCountdown(dt) {
   }
 }
 
-// Freeze play, and save the shift's score and combo if they beat the records.
+// A shift passes (and in Story unlocks the next level) with a C or better.
+const PASS_PERCENT = CONFIG.grades.find((g) => g.grade === 'C').min;
+
+// Freeze play, save records, and in Story unlock the next level on a pass.
+// Passing the last level in Story opens the celebration.
 function endShift() {
   setPhase('over');
   state.player.sprinting = false;
@@ -2077,8 +2624,33 @@ function endShift() {
   };
   saved.highScore = Math.max(saved.highScore, state.score);
   saved.bestComboLevel = Math.max(saved.bestComboLevel, state.best.comboLevel);
+
+  const n = LEVEL.level;
+  const grade = gradeFor(state.score);
+  const passed = scorePercent(state.score) >= PASS_PERCENT;
+  const book = state.mode === 'story' ? saved.story : saved.free;
+  const prev = book.bests[n];
+  const newBest = !prev || state.score > prev.score;
+  if (newBest) book.bests[n] = { score: state.score, grade };
+  let unlockedNow = false;
+  if (state.mode === 'story' && passed && n < LEVELS.length && saved.story.unlocked < n + 1) {
+    saved.story.unlocked = n + 1;
+    unlockedNow = true;
+  }
+  const storyDone = state.mode === 'story' && passed && n === LEVELS.length;
+  if (storyDone) saved.story.completed = true;
+  state.result = { passed, grade, newBest, unlockedNow, storyDone };
   persist();
-  sfx.shiftOver();
+
+  if (storyDone) {
+    setPhase('complete');
+    fx.confetti = [];
+    fx.confettiTimer = 0;
+    fx.cheer = 0;
+    sfx.fanfare();
+  } else {
+    sfx.shiftOver();
+  }
 }
 
 function update(dt) {
@@ -2260,7 +2832,7 @@ function groundShadow(x, y, rx, ry) {
 
 // Shallow fake perspective: 0.92 at the storefront, 1.0 at the bottom edge.
 function depthScale(y) {
-  return 0.92 + 0.08 * Math.max(0, Math.min(1, (y - 100) / (H - 100)));
+  return 0.92 + 0.08 * Math.max(0, Math.min(1, (y - 100) / (LOT.height - 100)));
 }
 
 // A chunky block: `path` traces the footprint in a local frame centered on
@@ -2300,12 +2872,20 @@ function inFrame(cx, cy, angle, s, lift, fn) {
 
 // ---- Ground ------------------------------------------------------------
 
-// Asphalt speckle, placed once so it doesn't shimmer.
-const SPECKS = (() => {
-  let seed = 7;
-  const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
-  return Array.from({ length: 260 }, () => ({ x: rand() * W, y: 162 + rand() * (H - 164), r: 0.8 + rand() * 1.6, light: rand() > 0.5 }));
-})();
+// Asphalt speckle, placed once per lot so it doesn't shimmer.
+const speckCache = new WeakMap();
+function asphaltSpecks() {
+  if (!speckCache.has(LOT)) {
+    const a = LOT.asphalt;
+    let seed = 7;
+    const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+    const count = Math.round((a.w * a.h) / 1420);
+    speckCache.set(LOT, Array.from({ length: count }, () => ({
+      x: a.x + rand() * a.w, y: a.y + 6 + rand() * (a.h - 8), r: 0.8 + rand() * 1.6, light: rand() > 0.5,
+    })));
+  }
+  return speckCache.get(LOT);
+}
 
 function wobblyLine(x1, y1, x2, y2, seed) {
   const len = Math.hypot(x2 - x1, y2 - y1);
@@ -2325,44 +2905,80 @@ function wobblyLine(x1, y1, x2, y2, seed) {
 }
 
 function drawGround() {
+  const world = LOT.world;
+  const sw = LOT.sidewalk;
+  const a = LOT.asphalt;
+
   // Mint lawn around the lot
-  fillRect({ x: 0, y: 0, w: W, h: H }, COLORS.grass);
+  fillRect(world, COLORS.grass);
 
   // Sidewalk with tiles and the red fire-lane curb
-  rr(0, 90, W, 76, 10, COLORS.sidewalk);
+  rr(sw.x, sw.y - 6, sw.w, sw.h + 12, 10, COLORS.sidewalk);
   ctx.strokeStyle = COLORS.sidewalkLine;
   ctx.lineWidth = 1.5;
-  for (let x = 24; x < W; x += 48) {
+  for (let x = sw.x + 24; x < sw.x + sw.w; x += 48) {
     ctx.beginPath();
-    ctx.moveTo(x, 98);
-    ctx.lineTo(x, 154);
+    ctx.moveTo(x, sw.y + 2);
+    ctx.lineTo(x, sw.y + sw.h - 6);
     ctx.stroke();
   }
   ctx.beginPath();
-  ctx.moveTo(0, 127);
-  ctx.lineTo(W, 127);
+  ctx.moveTo(sw.x, sw.y + 31);
+  ctx.lineTo(sw.x + sw.w, sw.y + 31);
   ctx.stroke();
 
   // Warm asphalt slab with rounded corners and a soft rim
-  rr(0, 156, W, H - 156 + 12, 26, COLORS.asphaltEdge);
-  rr(3, 159, W - 6, H - 159 + 8, 24, COLORS.asphalt);
-  for (const s of SPECKS) circle(s.x, s.y, s.r, s.light ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)');
-  rr(0, 154, W, 7, 3.5, COLORS.curbRed, COLORS.outline, 1.5);
+  rr(a.x, a.y, a.w, a.h + 12, 26, COLORS.asphaltEdge);
+  rr(a.x + 3, a.y + 3, a.w - 6, a.h + 5, 24, COLORS.asphalt);
+  for (const s of asphaltSpecks()) {
+    if (nearView(s.x, s.y, 10)) circle(s.x, s.y, s.r, s.light ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)');
+  }
+  rr(sw.x, sw.y + sw.h - 6, sw.w, 7, 3.5, COLORS.curbRed, COLORS.outline, 1.5);
 
   // Welcome mat at the doors
-  rr(LOT.doors.x + 6, 100, LOT.doors.w - 12, 20, 6, '#7a8f6a', COLORS.outline, 1.5);
+  rr(LOT.doors.x + 6, LOT.doors.y + LOT.doors.h + 4, LOT.doors.w - 12, 20, 6, '#7a8f6a', COLORS.outline, 1.5);
 
-  // Parking rows: thick, slightly wobbly cream lines
+  // Painted no-parking areas: cream hatching
+  for (const r of LOT.painted) {
+    if (!nearView(r.x + r.w / 2, r.y + r.h / 2, Math.max(r.w, r.h))) continue;
+    ctx.save();
+    rrPath(r.x + 4, r.y + 4, r.w - 8, r.h - 8, 8);
+    ctx.strokeStyle = 'rgba(247, 231, 166, 0.55)';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    ctx.clip();
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = 'rgba(247, 231, 166, 0.3)';
+    for (let x = r.x - r.h; x < r.x + r.w; x += 16) {
+      ctx.beginPath();
+      ctx.moveTo(x, r.y + r.h);
+      ctx.lineTo(x + r.h, r.y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // Parking rows: thick, slightly wobbly cream lines (none across painted gaps)
   ctx.strokeStyle = COLORS.line;
   ctx.lineWidth = 4;
   ctx.lineCap = 'round';
   for (const row of LOT.rows) {
-    for (let i = 0; i <= ROW_COUNT; i++) {
-      const x = ROW_X0 + i * SPACE_W;
+    if (row.y > cam.y + H + 80 || row.y + SPACE_D < cam.y - 80) continue;
+    const gap = (i) => (row.gaps || []).some(([g0, g1]) => i >= g0 && i <= g1);
+    for (let i = 0; i <= row.stalls; i++) {
+      const x = row.x + i * SPACE_W;
+      if (x < cam.x - 60 || x > cam.x + W + 60) continue;
+      if ((i === 0 || gap(i - 1)) && (i === row.stalls || gap(i))) continue;
       wobblyLine(x, row.y + 4, x, row.y + SPACE_D - 4, i + row.y);
     }
     const endY = row.open === 'up' ? row.y + SPACE_D - 2 : row.y + 2;
-    wobblyLine(ROW_X0, endY, ROW_X0 + LOT.rowW, endY, row.y);
+    let from = 0;
+    for (let i = 0; i <= row.stalls; i++) {
+      if (i === row.stalls || gap(i)) {
+        if (i > from) wobblyLine(row.x + from * SPACE_W, endY, row.x + i * SPACE_W, endY, row.y + from);
+        from = i + 1;
+      }
+    }
   }
   ctx.lineCap = 'butt';
 
@@ -2377,17 +2993,22 @@ function drawGround() {
   drawAisleArrows();
   drawGates();
 
-  // Bin floor and corral floor
-  const bin = LOT.bin;
-  rr(bin.x + 2, bin.y + 2, bin.w - 4, bin.h - 4, 8, '#5d6878');
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
-  ctx.lineWidth = 2;
-  ctx.setLineDash([6, 5]);
-  ctx.beginPath();
-  ctx.moveTo(bin.x + bin.w / 2, bin.y + 6);
-  ctx.lineTo(bin.x + bin.w / 2, bin.y + bin.h - 8);
-  ctx.stroke();
-  ctx.setLineDash([]);
+  // Bin floors with dashed lines between their lanes, then the corral floor
+  for (const bin of LOT.bins) {
+    const r = bin.rect;
+    rr(r.x + 2, r.y + 2, r.w - 4, r.h - 4, 8, '#5d6878');
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 5]);
+    for (let i = 1; i < bin.stalls; i++) {
+      const x = r.x + RAIL + ((r.w - RAIL * 2) * i) / bin.stalls;
+      ctx.beginPath();
+      ctx.moveTo(x, r.y + 6);
+      ctx.lineTo(x, r.y + r.h - 8);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
 
   const z = LOT.returnZone;
   rr(z.x - 2, z.y - 2, z.w + 4, z.h + 6, 8, '#ffe6a0');
@@ -2432,17 +3053,40 @@ function drawAisleArrows() {
     ctx.fill();
     ctx.restore();
   };
-  // One-way lanes: east on the fire lane, west on the middle and bottom
-  // aisles, south on the right edge, north on the left edge.
-  for (let x = 200; x < W - 100; x += 280) {
-    arrow(x, 180, 0);
-    arrow(x + 80, 360, Math.PI);
-    arrow(x + 40, 500, Math.PI);
+  // One-way lanes: arrows painted along each straight run of road.
+  for (const a of laneArrows()) arrow(a.x, a.y, a.angle);
+}
+
+// Arrow spots for the current lot: each straight run of lane edges (not the
+// entrance stubs) gets an arrow every ~260 px, pointing the way traffic flows.
+const arrowCache = new WeakMap();
+function laneArrows() {
+  if (arrowCache.has(LOT)) return arrowCache.get(LOT);
+  const { nodes, edges, gates } = LOT.lanes;
+  const gateNodes = new Set(gates.flatMap((g) => [g.in, g.out]));
+  const road = edges.filter(([a, b]) => !gateNodes.has(a) && !gateNodes.has(b));
+  const dir = ([a, b]) => Math.atan2(nodes[b].y - nodes[a].y, nodes[b].x - nodes[a].x);
+  const straightOn = (e, f) => Math.abs(wrapAngle(dir(e) - dir(f))) < 0.01;
+  const out = [];
+  for (const e of road) {
+    // A run starts where no edge leads straight into this one
+    if (road.some((f) => f[1] === e[0] && straightOn(f, e))) continue;
+    let end = e;
+    for (;;) {
+      const next = road.find((f) => f[0] === end[1] && straightOn(f, end));
+      if (!next) break;
+      end = next;
+    }
+    const a = nodes[e[0]];
+    const b = nodes[end[1]];
+    const n = Math.max(1, Math.round(Math.hypot(b.x - a.x, b.y - a.y) / 260));
+    for (let i = 0; i < n; i++) {
+      const t = (i + 0.5) / n;
+      out.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, angle: dir(e) });
+    }
   }
-  arrow(28, 440, -Math.PI / 2);
-  arrow(28, 270, -Math.PI / 2);
-  arrow(932, 270, Math.PI / 2);
-  arrow(932, 440, Math.PI / 2);
+  arrowCache.set(LOT, out);
+  return out;
 }
 
 // Entrances: rounded yellow IN / OUT tags at the lot edge.
@@ -2455,14 +3099,14 @@ function drawGates() {
     ctx.fillStyle = COLORS.ink;
     ctx.fillText(text, x, y + 0.5);
   };
-  for (const g of GATES) {
-    const inPt = LANE_NODES[g.in];
-    const outPt = LANE_NODES[g.out];
+  for (const g of LOT.lanes.gates) {
+    const inPt = LOT.lanes.nodes[g.in];
+    const outPt = LOT.lanes.nodes[g.out];
     if (g.side === 'bottom') {
-      tag(inPt.x, H - 12, 'IN');
-      tag(outPt.x, H - 12, 'OUT');
+      tag(inPt.x, LOT.height - 12, 'IN');
+      tag(outPt.x, LOT.height - 12, 'OUT');
     } else {
-      const x = g.side === 'left' ? 18 : W - 18;
+      const x = g.side === 'left' ? 18 : LOT.width - 18;
       tag(x, inPt.y, 'IN');
       tag(x, outPt.y, 'OUT');
     }
@@ -2471,25 +3115,31 @@ function drawGates() {
 
 // ---- Storefront -----------------------------------------------------------
 
+// The storefront details hang off the store's front edge (its bottom), so a
+// taller store just shows more wall above the awning.
 function drawStore() {
-  const { doors } = LOT;
+  const { doors, store } = LOT;
+  const deco = LOT.layout.store;
+  const front = store.y + store.h; // y of the store's front wall
+  const x0 = store.x;
+  const x1 = store.x + store.w;
   // Cream wall with a roof cap
-  fillRect({ x: 0, y: 0, w: W, h: 96 }, COLORS.wall);
-  fillRect({ x: 0, y: 0, w: W, h: 10 }, COLORS.roof);
-  fillRect({ x: 0, y: 86, w: W, h: 10 }, COLORS.wallShade);
+  fillRect(store, COLORS.wall);
+  fillRect({ x: x0, y: store.y, w: store.w, h: 10 }, COLORS.roof);
+  fillRect({ x: x0, y: front - 10, w: store.w, h: 10 }, COLORS.wallShade);
 
   // Big windows with produce stacked inside
   const produce = ['#e8513f', '#ffb13c', '#7cc85a', '#ffd84a', '#e8513f', '#b36ad8'];
-  for (const [x0, x1] of [[20, 214], [346, 382], [708, 940]]) {
-    rr(x0, 50, x1 - x0, 34, 8, COLORS.glass, COLORS.outline, 2);
-    for (let x = x0 + 9, i = 0; x < x1 - 6; x += 11, i++) circle(x, 78, 5, produce[i % produce.length]);
+  for (const [wx0, wx1] of deco.windows) {
+    rr(wx0, front - 46, wx1 - wx0, 34, 8, COLORS.glass, COLORS.outline, 2);
+    for (let x = wx0 + 9, i = 0; x < wx1 - 6; x += 11, i++) circle(x, front - 18, 5, produce[i % produce.length]);
     ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
-    ctx.fillRect(x0 + 8, 54, 6, 18);
+    ctx.fillRect(wx0 + 8, front - 42, 6, 18);
   }
 
   // Striped awning with a scalloped edge
-  const ay = 38, ah = 14;
-  for (let x = 0, i = 0; x < W; x += 24, i++) {
+  const ay = front - 58, ah = 14;
+  for (let x = x0, i = 0; x < x1; x += 24, i++) {
     ctx.fillStyle = i % 2 ? COLORS.awningStripe : COLORS.awning;
     ctx.fillRect(x, ay, 24, ah);
     ctx.beginPath();
@@ -2499,37 +3149,38 @@ function drawStore() {
   ctx.strokeStyle = COLORS.outline;
   ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.moveTo(0, ay);
-  ctx.lineTo(W, ay);
+  ctx.moveTo(x0, ay);
+  ctx.lineTo(x1, ay);
   ctx.stroke();
 
   // Big automatic glass doors, framed
-  rr(doors.x - 6, 26, doors.w + 12, 72, 12, '#f7f2e6', COLORS.outline, 2.5);
-  rr(doors.x, 34, doors.w, 62, 8, COLORS.glass, COLORS.outline, 2);
+  rr(doors.x - 6, front - 70, doors.w + 12, 72, 12, '#f7f2e6', COLORS.outline, 2.5);
+  rr(doors.x, front - 62, doors.w, 62, 8, COLORS.glass, COLORS.outline, 2);
   ctx.strokeStyle = COLORS.outline;
   ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.moveTo(doors.x + doors.w / 2, 34);
-  ctx.lineTo(doors.x + doors.w / 2, 96);
+  ctx.moveTo(doors.x + doors.w / 2, front - 62);
+  ctx.lineTo(doors.x + doors.w / 2, front);
   ctx.stroke();
   ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
   ctx.beginPath();
-  ctx.moveTo(doors.x + 8, 90);
-  ctx.lineTo(doors.x + 22, 40);
-  ctx.lineTo(doors.x + 30, 40);
-  ctx.lineTo(doors.x + 16, 90);
+  ctx.moveTo(doors.x + 8, front - 6);
+  ctx.lineTo(doors.x + 22, front - 56);
+  ctx.lineTo(doors.x + 30, front - 56);
+  ctx.lineTo(doors.x + 16, front - 6);
   ctx.fill();
 
   // GROCERY sign
-  rr(W / 2 - 100, 4, 200, 40, 20, COLORS.tomato, COLORS.outline, 3);
+  const sy = front - 92;
+  rr(deco.signX - 100, sy, 200, 40, 20, COLORS.tomato, COLORS.outline, 3);
   ctx.fillStyle = COLORS.cream;
   ctx.font = `900 24px ${FONT}`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('GROCERY', W / 2, 25);
+  ctx.fillText('GROCERY', deco.signX, sy + 21);
 
   // "Please return your carts" board with a smiling cart
-  const bx = 594, by = 2, bw = 100, bh = 34;
+  const bx = deco.boardX, by = front - 94, bw = 100, bh = 34;
   rr(bx, by, bw, bh, 8, COLORS.cream, COLORS.outline, 2);
   drawCartIcon(bx + 14, by + 18, 0.7, true);
   ctx.fillStyle = COLORS.ink;
@@ -3017,20 +3668,24 @@ function drawWorld() {
   drawDockGlow();
   drawPuffs();
 
+  // Props outside the camera's view (plus a margin) are skipped.
   const props = [];
-  const add = (key, fn) => props.push({ key, fn });
+  const add = (key, fn, x, y) => {
+    if (x !== undefined && !nearView(x, y)) return;
+    props.push({ key, fn });
+  };
 
   for (const [id, car] of state.parked) {
     const sp = LOT.spaceById[id];
     const b = parkedBox(sp);
-    add(b.y + b.h, () => drawCarProp(sp.center.x, sp.center.y, sp.pullAngle, car.color));
+    add(b.y + b.h, () => drawCarProp(sp.center.x, sp.center.y, sp.pullAngle, car.color), sp.center.x, sp.center.y);
   }
   for (const car of state.traffic) {
     const b = vehicleBox(car);
-    add(b.y + b.h, () => drawCarProp(car.cx, car.cy, car.angle, car.color, { lights: true, reverse: car.reverse }));
+    add(b.y + b.h, () => drawCarProp(car.cx, car.cy, car.angle, car.color, { lights: true, reverse: car.reverse }), car.cx, car.cy);
   }
   for (const cart of state.carts) {
-    add(cart.y + cart.h, () => drawCartProp(cart.x + cart.w / 2, cart.y + cart.h / 2, cart.angle, cart.kind, cartMotion(cart)));
+    add(cart.y + cart.h, () => drawCartProp(cart.x + cart.w / 2, cart.y + cart.h / 2, cart.angle, cart.kind, cartMotion(cart)), cart.x, cart.y);
   }
   // Docked carts settling into the corral: a small drop with overshoot, then fade
   for (const g of fx.ghosts) {
@@ -3039,12 +3694,12 @@ function drawWorld() {
     add(g.y + 10, () => drawCartProp(g.x, g.y, g.angle, g.kind, { lift: 6 * (1 - settle), alpha }));
   }
   add(state.player.y + state.player.h, drawPlayerProp);
-  for (const sh of state.shoppers) add(sh.y + CONFIG.shopperSize / 2, () => drawShopperProp(sh));
-  for (const isl of LOT.islands) add(isl.y + isl.h, () => drawIslandProp(isl));
-  for (const lamp of LOT.lampPosts) add(lamp.y + lamp.h, () => drawLampProp(lamp));
+  for (const sh of state.shoppers) add(sh.y + CONFIG.shopperSize / 2, () => drawShopperProp(sh), sh.x, sh.y);
+  for (const isl of LOT.islands) add(isl.y + isl.h, () => drawIslandProp(isl), isl.x + isl.w / 2, Math.max(isl.y, Math.min(isl.y + isl.h, cam.y + H / 2)));
+  for (const lamp of LOT.lampPosts) add(lamp.y + lamp.h, () => drawLampProp(lamp), lamp.x, lamp.y);
   const binFlash = fx.binFlash > 0 && Math.floor(fx.binFlash * 8) % 2 === 0;
-  for (const r of LOT.binRails) add(r.y + r.h, () => drawRail(r, 12, binFlash));
-  for (const r of LOT.corralRails) add(r.y + r.h, () => drawRail(r, 14, false));
+  for (const r of LOT.binRails) add(r.y + r.h, () => drawRail(r, 12, binFlash), r.x, r.y);
+  for (const r of LOT.corralRails) add(r.y + r.h, () => drawRail(r, 14, false), r.x, r.y);
 
   props.sort((a, b) => a.key - b.key);
   for (const prop of props) prop.fn();
@@ -3130,7 +3785,7 @@ function drawSticker() {
   const alpha = st.t < 1.2 ? 1 : Math.max(0, 1 - (st.t - 1.2) / 0.3);
   ctx.save();
   ctx.globalAlpha = alpha;
-  ctx.translate(W / 2 + 205, 70);
+  ctx.translate(LOT.layout.store.signX + 205, LOT.store.y + LOT.store.h - 26); // on the awning
   ctx.rotate(-0.12);
   ctx.scale(pop, pop);
   ctx.font = `900 20px ${FONT}`;
@@ -3267,6 +3922,15 @@ function drawHud() {
   text(`${comboMult()}x`, kx + 14, 36, 20, live ? COLORS.tomato : 'rgba(59, 43, 43, 0.45)');
   meter(kx + 70, 22, 78, 13, live ? state.combo.timer / CONFIG.comboWindow : 0, COLORS.gold);
 
+  // Level, chapter and par
+  const lvText = `LV ${LEVEL.level}  \u00b7  ${CHAPTERS[LEVEL.chapter - 1].name.toUpperCase()}  \u00b7  PAR ${LEVEL.par}${state.mode === 'free' ? '  \u00b7  FREE PLAY' : ''}`;
+  ctx.font = `900 11px ${FONT}`;
+  const lvW = ctx.measureText(lvText).width + 26;
+  pill(12, 56, lvW, 24, COLORS.cream, 12);
+  text(lvText, 25, 68.5, 11, COLORS.tomatoDark, 'left', 900);
+
+  drawMinimap();
+
   // Stamina: a lightning bolt and a rounded meter
   const sy = H - 46;
   pill(12, sy, 206, 34, COLORS.cream, 17);
@@ -3364,8 +4028,9 @@ function drawHudButtons() {
 // one gets a gold ring and a gentle pulse.
 function drawMenuButtons() {
   menuButtons().forEach((b, i) => {
+    if (b.kind === 'level') return; // drawn by drawLevelSelect
     const focused = i === state.menuFocus;
-    const primary = b.action === 'play' || b.action === 'resume';
+    const primary = b.primary || b.action === 'resume';
     const cap = primary ? COLORS.tomato : COLORS.cream;
     const lip = primary ? COLORS.tomatoDark : COLORS.creamDark;
     const ink = primary ? COLORS.cream : COLORS.ink;
@@ -3613,6 +4278,175 @@ function drawHowTo() {
   drawMenuButtons();
 }
 
+// Story or Free Play.
+function drawModeSelect() {
+  dim(0.45);
+  awningCard(270, 92, 420, 368);
+  stickerText('PLAY', W / 2, 146, 34, COLORS.gold);
+  drawMenuButtons();
+  const story = state.saved.story;
+  const caption = story.completed ? 'Story complete! Replay any level' : `Level ${story.unlocked} of ${LEVELS.length} unlocked`;
+  text(caption, W / 2, 262, 13, COLORS.tomatoDark, 'center', 800);
+  text('Any level, any time · no unlocking', W / 2, 362, 13, COLORS.tomatoDark, 'center', 800);
+}
+
+// Map facts per chapter for the level list (built once).
+const chapterFacts = CHAPTERS.map((ch) => {
+  const lot = buildLot(ch.layout);
+  return { size: `${lot.width}×${lot.height}`, rows: lot.rows.length, bins: lot.bins.length };
+});
+
+// The level list: one card per chapter with its five levels. Story shows
+// locks past the furthest unlocked level; both show the best grade so far.
+function drawLevelSelect() {
+  dim(0.5);
+  const story = state.selectMode === 'story';
+  stickerText(story ? 'STORY MODE' : 'FREE PLAY', W / 2, 38, 30, story ? COLORS.gold : '#6fdc9a');
+  const bests = story ? state.saved.story.bests : state.saved.free.bests;
+  const buttons = menuButtons();
+
+  CHAPTERS.forEach((ch, c) => {
+    const y = LEVEL_GRID_Y + c * 78;
+    const chapterLocked = story && c * 5 + 1 > state.saved.story.unlocked;
+    ctx.save();
+    if (chapterLocked) ctx.globalAlpha = 0.6;
+    rr(110, y + 4, 740, 66, 16, 'rgba(59, 43, 43, 0.28)');
+    rr(110, y, 740, 66, 16, COLORS.cream, COLORS.outline, 2.5);
+    circle(144, y + 33, 18, COLORS.tomato, COLORS.outline, 2);
+    text(String(c + 1), 144, y + 34, 18, COLORS.cream, 'center', 900);
+    text(ch.name, 172, y + 24, 18, COLORS.ink, 'left', 900);
+    const f = chapterFacts[c];
+    text(`${f.size} · ${f.rows} rows · ${f.bins} bin${f.bins > 1 ? 's' : ''}`, 172, y + 46, 11, 'rgba(59, 43, 43, 0.65)', 'left', 700);
+    ctx.restore();
+  });
+
+  buttons.forEach((b, i) => {
+    if (b.kind !== 'level') return;
+    const focused = i === state.menuFocus;
+    const current = story && b.level === state.saved.story.unlocked && !state.saved.story.completed;
+    const shake = fx.lockedTap && fx.lockedTap.n === b.level ? Math.sin(fx.lockedTap.t * 60) * 4 : 0;
+    const cap = b.locked ? '#ddd5c4' : current ? COLORS.tomato : COLORS.cream;
+    const lip = b.locked ? '#bdb4a2' : current ? COLORS.tomatoDark : COLORS.creamDark;
+    const ink = b.locked ? 'rgba(59, 43, 43, 0.4)' : current ? COLORS.cream : COLORS.ink;
+    ctx.save();
+    ctx.translate(b.x + b.w / 2 + shake, b.y + b.h / 2);
+    if (focused) ctx.scale(1.05, 1.05);
+    const x = -b.w / 2, y = -b.h / 2;
+    if (focused) rr(x - 5, y - 5, b.w + 10, b.h + 13, 17, null, COLORS.gold, 4);
+    rr(x, y + 5, b.w, b.h, 14, lip, COLORS.outline, 2);
+    rr(x, y, b.w, b.h, 14, cap, COLORS.outline, 2);
+    if (b.locked) {
+      // padlock
+      ctx.strokeStyle = ink;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(0, -4, 6, Math.PI, 0);
+      ctx.stroke();
+      rr(-9, -4, 18, 14, 3, ink);
+    } else {
+      text(b.label, 0, 1, 21, ink, 'center', 900);
+      const best = bests[b.level];
+      if (best) {
+        const gc = best.grade === 'A' ? '#1f9a70' : best.grade === 'F' ? '#c62f24' : '#d0622a';
+        circle(b.w / 2 - 6, -b.h / 2 + 6, 10, '#ffffff', gc, 2);
+        text(best.grade, b.w / 2 - 6, -b.h / 2 + 7, 11, gc, 'center', 900);
+      }
+    }
+    ctx.restore();
+  });
+  drawMenuButtons();
+  if (story && fx.lockedTap) text('Finish the level before it with a C or better to unlock it', W / 2, 466, 12, COLORS.cream, 'center', 800);
+}
+
+// ---- Story complete -----------------------------------------------------------
+
+const CHEERS = [
+  'Every cart, home safe. Legendary.',
+  "You're the best cart jockey this side of aisle 9!",
+  'The lot has never looked this tidy.',
+  'Five stores. Twenty-five shifts. Zero carts left behind.',
+  'Shift supervisor? Try shift SUPERSTAR.',
+  'The carts are throwing you a parade!',
+];
+
+function updateConfetti(dt) {
+  if (!fx.confetti) fx.confetti = [];
+  if (state.phase === 'complete') {
+    fx.cheer = (fx.cheer || 0) + dt;
+    fx.confettiTimer = (fx.confettiTimer || 0) - dt;
+    const colors = [COLORS.tomato, COLORS.gold, COLORS.teal, '#5b7fe0', '#b99af0', '#7ed9b0', '#ff8a70', '#ffffff'];
+    const spawn = (x, y, n, power) => {
+      for (let i = 0; i < n && fx.confetti.length < 600; i++) {
+        const a = -Math.PI / 2 + (Math.random() - 0.5) * 2.2;
+        const v = power * (0.5 + Math.random() * 0.7);
+        fx.confetti.push({
+          x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, rot: Math.random() * 6, vr: (Math.random() - 0.5) * 12,
+          w: 5 + Math.random() * 6, h: 3 + Math.random() * 4, color: colors[Math.floor(Math.random() * colors.length)], life: 4,
+        });
+      }
+    };
+    // Steady rain from the top, plus big bursts from the bottom corners and center
+    if (Math.random() < dt * 40) spawn(Math.random() * W, -10, 2, 60);
+    if (fx.confettiTimer <= 0) {
+      fx.confettiTimer = 0.9;
+      const spots = [[60, H], [W - 60, H], [W / 2 + (Math.random() - 0.5) * 400, H]];
+      const [bx, by] = spots[Math.floor(Math.random() * spots.length)];
+      spawn(bx, by, 70, 520);
+    }
+  }
+  for (const p of fx.confetti) {
+    p.vy += 380 * dt;
+    p.vx *= 1 - 0.8 * dt;
+    p.vy *= 1 - 0.6 * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.rot += p.vr * dt;
+    p.life -= dt;
+  }
+  fx.confetti = fx.confetti.filter((p) => p.life > 0 && p.y < H + 40);
+}
+
+function drawConfetti() {
+  for (const p of fx.confetti || []) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    ctx.scale(1, Math.cos(p.rot * 1.7)); // flutter
+    ctx.fillStyle = p.color;
+    ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+    ctx.restore();
+  }
+}
+
+// Finishing level 25 in Story: confetti, a fanfare and a lot of cheering.
+function drawStoryComplete() {
+  dim(0.35);
+  drawSunburst(W / 2, 170);
+  drawParade();
+  const t = fx.cheer || 0;
+  const pop = t < 0.5 ? easeOutBack(Math.min(1, t / 0.5)) : 1 + Math.sin(t * 4) * 0.04;
+  stickerText('YOU DID IT!', W / 2, 112, 78, COLORS.gold, Math.max(0.01, pop));
+  stickerText('STORY COMPLETE', W / 2, 180, 30, COLORS.cream);
+  // Rotating words of encouragement
+  const i = Math.floor(t / 2.6) % CHEERS.length;
+  const phaseT = t % 2.6;
+  const alpha = Math.min(1, phaseT / 0.3, (2.6 - phaseT) / 0.3);
+  ctx.save();
+  ctx.globalAlpha = Math.max(0, alpha);
+  ctx.font = `800 17px ${FONT}`;
+  const cw = ctx.measureText(CHEERS[i]).width + 40;
+  pill(W / 2 - cw / 2, 222, cw, 36, COLORS.cream);
+  text(CHEERS[i], W / 2, 240, 17, COLORS.ink, 'center', 800);
+  ctx.restore();
+  const r = state.result || {};
+  rr(W / 2 - 230, 278 + 4, 460, 64, 16, 'rgba(59, 43, 43, 0.28)');
+  rr(W / 2 - 230, 278, 460, 64, 16, COLORS.cream, COLORS.outline, 2.5);
+  text(`All ${LEVELS.length} levels cleared  ·  final shift ${state.score} pts, grade ${r.grade || gradeFor(state.score)}`, W / 2, 300, 15, COLORS.ink, 'center', 800);
+  text('Every level stays open in Story and Free Play.', W / 2, 324, 13, COLORS.tomatoDark, 'center', 700);
+  drawMenuButtons();
+  drawConfetti();
+}
+
 function drawPaused() {
   dim(0.45);
   awningCard(300, 108, 360, 318);
@@ -3658,8 +4492,8 @@ function drawTally() {
   const ink = '#2e2a2a';
   drawCartIcon(W / 2, y + 30, 1.2, true);
   text('CART JOCKEY MARKET', W / 2, y + 56, 15, ink, 'center', 800, MONO);
-  text('SHIFT RECEIPT', W / 2, y + 74, 11, ink, 'center', 500, MONO);
-  text(new Date().toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }), W / 2, y + 89, 10, '#6f6a66', 'center', 500, MONO);
+  text(`LEVEL ${LEVEL.level} \u00b7 ${CHAPTERS[LEVEL.chapter - 1].name.toUpperCase()}`, W / 2, y + 74, 11, ink, 'center', 700, MONO);
+  text(`${state.mode === 'story' ? 'STORY' : 'FREE PLAY'} \u00b7 ${new Date().toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}`, W / 2, y + 89, 10, '#6f6a66', 'center', 500, MONO);
 
   const dashed = (yy) => {
     ctx.strokeStyle = '#8f8a84';
@@ -3695,7 +4529,7 @@ function drawTally() {
   row('HIGH SCORE', String(s.highScore), y + 177, false, state.newRecord.score ? 'NEW' : '');
   dashed(y + 193);
   row('SCORE', String(state.score), y + 211, true);
-  row('PAR', String(CONFIG.parScore), y + 230);
+  row('PAR', String(LEVEL.par), y + 230);
   row('PERCENT', `${scorePercent(state.score)}%`, y + 249);
   dashed(y + 265);
 
@@ -3713,7 +4547,15 @@ function drawTally() {
   text('GRADE', left, y + 294, 12, ink, 'left', 800, MONO);
   const scale = CONFIG.grades.map((g) => (g.min > 0 ? `${g.grade}${g.min}+` : `${g.grade}<${CONFIG.grades[CONFIG.grades.length - 2].min}`)).join(' ');
   text(scale, left, y + 312, 9, '#6f6a66', 'left', 500, MONO);
-  if (state.newRecord.score) text('** NEW HIGH SCORE **', left, y + 330, 10, COLORS.tomato, 'left', 800, MONO);
+  // Pass/unlock line
+  const r = state.result || {};
+  let note = '';
+  let noteColor = '#6f6a66';
+  if (r.unlockedNow) [note, noteColor] = [`** LEVEL ${LEVEL.level + 1} UNLOCKED! **`, '#1f9a70'];
+  else if (state.mode === 'story' && !r.passed) [note, noteColor] = [`NEED A C (${PASS_PERCENT}%) TO UNLOCK`, COLORS.tomato];
+  else if (state.newRecord.score) [note, noteColor] = ['** NEW HIGH SCORE **', COLORS.tomato];
+  else if (r.newBest) [note, noteColor] = ['** NEW LEVEL BEST **', '#1f9a70'];
+  if (note) text(note, left, y + 330, 10, noteColor, 'left', 800, MONO);
 
   // Barcode and thanks
   let bx = W / 2 - 60;
@@ -3871,10 +4713,16 @@ function drawDebug() {
     pts.slice(1).forEach((pt, i) => ctx.fillText(String(i + 1), pt.x, pt.y - 14));
   }
 
+}
+
+// The debug readout, in screen space.
+function drawDebugPanel() {
+  const p = state.player;
+  const hasTrain = p.train.length > 0;
   const n = p.train.length;
   const nose = hasTrain ? trainCarts()[n - 1] : null;
   ctx.fillStyle = COLORS.hudBg;
-  ctx.fillRect(W - 282, 50, 270, 114);
+  ctx.fillRect(W - 282, 50, 270, 132);
   ctx.fillStyle = COLORS.hudText;
   ctx.font = '11px ui-monospace, monospace';
   ctx.textAlign = 'left';
@@ -3889,6 +4737,7 @@ function drawDebug() {
   );
   ctx.fillText(`combo ${state.combo.timer.toFixed(1)}s  fresh ${state.freshPickup}  invuln ${p.invuln.toFixed(1)}`, lx, 134);
   ctx.fillText(`parked ${state.parked.size}  moving ${state.traffic.length}  shoppers ${state.shoppers.length}  arrive ${state.arriveTimer.toFixed(1)}`, lx, 152);
+  ctx.fillText(`L${LEVEL.level} ${CHAPTERS[LEVEL.chapter - 1].name} ${LOT.width}x${LOT.height}  cam ${Math.round(cam.x)},${Math.round(cam.y)}`, lx, 170);
 }
 
 // Advance presentation-only animation clocks (frozen while paused).
@@ -3896,6 +4745,7 @@ function tickFx() {
   const now = performance.now();
   const dt = fx.lastNow ? Math.min(0.05, (now - fx.lastNow) / 1000) : 0;
   fx.lastNow = now;
+  updateCamera(dt);
   if (state.phase === 'paused') return;
   fx.time += dt;
   for (const list of [fx.ghosts, fx.puffs, fx.honks]) for (const e of list) e.t += dt;
@@ -3907,6 +4757,11 @@ function tickFx() {
     if (fx.sticker.t > 1.5) fx.sticker = null;
   }
   fx.binFlash = Math.max(0, fx.binFlash - dt);
+  if (fx.lockedTap) {
+    fx.lockedTap.t -= dt;
+    if (fx.lockedTap.t <= 0) fx.lockedTap = null;
+  }
+  updateConfetti(dt);
   const p = state.player;
   const pos = { x: p.x, y: p.y };
   const moved = fx.lastPos ? Math.hypot(pos.x - fx.lastPos.x, pos.y - fx.lastPos.y) : 0;
@@ -3917,10 +4772,89 @@ function tickFx() {
   }
 }
 
+// ---- Camera ------------------------------------------------------------------
+//
+// Follows the player, clamped to the world. When the world fits on screen
+// (chapter 1) it stays put. Only world drawing moves with it; the HUD, menus
+// and taps stay in screen space.
+const cam = { x: 0, y: 0 };
+
+function cameraFollows() {
+  return LOT.width > W || LOT.height > H;
+}
+
+function cameraTarget() {
+  const c = center(state.player);
+  return {
+    x: Math.max(0, Math.min(LOT.width - W, c.x - W / 2)),
+    y: Math.max(0, Math.min(LOT.height - H, c.y - H / 2)),
+  };
+}
+
+function updateCamera(dt) {
+  const t = cameraTarget();
+  // Ease toward the player; jump straight there after a level load or restart.
+  if (Math.hypot(t.x - cam.x, t.y - cam.y) > W / 2 || !dt) {
+    cam.x = t.x;
+    cam.y = t.y;
+    return;
+  }
+  const k = Math.min(1, dt * 8);
+  cam.x += (t.x - cam.x) * k;
+  cam.y += (t.y - cam.y) * k;
+}
+
+// Is a world point within the camera's view (plus a margin)?
+function nearView(x, y, margin = 120) {
+  return x > cam.x - margin && x < cam.x + W + margin && y > cam.y - margin && y < cam.y + H + margin;
+}
+
+// Minimap, bottom left above the stamina meter, whenever the lot is bigger
+// than the screen: the lot, store, corral, bins, strays, the player and their
+// train, and the camera's view.
+function drawMinimap() {
+  if (!cameraFollows()) return;
+  const mw = 190;
+  const k = mw / LOT.width;
+  const mh = LOT.height * k;
+  const x0 = 12;
+  const y0 = H - 54 - mh - 8;
+  rr(x0 - 4, y0 - 4 + 3, mw + 8, mh + 8, 10, 'rgba(59, 43, 43, 0.28)');
+  rr(x0 - 4, y0 - 4, mw + 8, mh + 8, 10, COLORS.cream, COLORS.outline, 2);
+  const m = (r) => ({ x: x0 + r.x * k, y: y0 + r.y * k, w: Math.max(1.5, r.w * k), h: Math.max(1.5, r.h * k) });
+  ctx.save();
+  rrPath(x0, y0, mw, mh, 6);
+  ctx.clip();
+  fillRect(m(LOT.world), COLORS.grass);
+  fillRect(m(LOT.asphalt), COLORS.asphalt);
+  fillRect(m(LOT.store), COLORS.awning);
+  for (const id of state.parked.keys()) fillRect(m(parkedBox(LOT.spaceById[id])), 'rgba(255, 255, 255, 0.35)');
+  fillRect(m(LOT.corral), COLORS.yellow);
+  for (const bin of LOT.bins) {
+    const b = m(bin.rect);
+    rr(b.x, b.y, b.w, b.h, 1.5, COLORS.yellow, COLORS.outline, 1);
+  }
+  for (const c of state.carts) {
+    if (c.status !== 'loose') continue;
+    circle(x0 + (c.x + 10) * k, y0 + (c.y + 10) * k, 1.6, c.kind === 'stray' ? COLORS.gold : '#ffffff');
+  }
+  for (const c of trainCarts()) circle(x0 + (c.x + 10) * k, y0 + (c.y + 10) * k, 1.8, '#ffffff');
+  const pc = center(state.player);
+  circle(x0 + pc.x * k, y0 + pc.y * k, 3, COLORS.teal, COLORS.outline, 1);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+  ctx.lineWidth = 1.2;
+  ctx.strokeRect(x0 + cam.x * k, y0 + cam.y * k, W * k, H * k);
+  ctx.restore();
+}
+
 function draw() {
   tickFx();
+  ctx.save();
+  ctx.translate(-Math.round(cam.x), -Math.round(cam.y));
   drawWorld();
   if (state.debug) drawDebug();
+  ctx.restore();
+  if (state.debug) drawDebugPanel();
 
   const phase = state.phase;
   const inShift = phase === 'countdown' || phase === 'playing' || phase === 'paused';
@@ -3929,6 +4863,9 @@ function draw() {
   if (phase === 'countdown') drawCountdown();
   if (phase === 'playing' && state.goFlash > 0) drawGo();
   if (phase === 'title') drawTitle();
+  else if (phase === 'mode') drawModeSelect();
+  else if (phase === 'levels') drawLevelSelect();
+  else if (phase === 'complete') drawStoryComplete();
   else if (phase === 'howto') drawHowTo();
   else if (phase === 'paused') drawPaused();
   else if (phase === 'over') drawTally();
@@ -3963,5 +4900,6 @@ window.lotRunner = {
   state, LOT, CONFIG, held, setHeld, pressAction, resetSession,
   spawnStray, spawnArrival, spawnDeparture, findRoute, trainBonus, gradeFor, scorePercent,
   inputLog, sfx, menuButtons, hudButtons, persist, STORE_KEY,
-  spawnShopperFromStore, planWalk, makeLook,
+  spawnShopperFromStore, planWalk, makeLook, LAYOUTS, buildLot,
+  loadLevel, LEVELS, CHAPTERS, levelInfo, expandTemplate, endShift, PASS_PERCENT,
 };

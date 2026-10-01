@@ -673,7 +673,8 @@ function randBetween([lo, hi]) {
 // Saved between visits: best score, best combo, and the mute setting.
 // localStorage can be missing or throw (private windows, blocked storage);
 // the game then just plays without saving.
-const STORE_KEY = 'lotRunner.v1';
+const STORE_KEY = 'cartJockey.v1';
+const OLD_STORE_KEY = 'lotRunner.v1'; // from when the game was called Lot Runner; read once to carry saves over
 
 // Also kept: Story progress (highest unlocked level, whether the story is
 // finished) and the best score and grade per level, separately for Story and
@@ -698,7 +699,7 @@ function loadSaved() {
     free: { bests: {} },
   };
   try {
-    const raw = JSON.parse(window.localStorage.getItem(STORE_KEY));
+    const raw = JSON.parse(window.localStorage.getItem(STORE_KEY) ?? window.localStorage.getItem(OLD_STORE_KEY));
     if (raw && typeof raw === 'object') {
       if (Number.isFinite(raw.highScore)) saved.highScore = Math.max(0, raw.highScore);
       if (Number.isInteger(raw.bestComboLevel)) {
@@ -5117,7 +5118,7 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 // Exposed for debugging in the console.
-window.lotRunner = {
+window.cartJockey = {
   state, LOT, CONFIG, held, setHeld, pressAction, resetSession,
   spawnStray, spawnArrival, spawnDeparture, findRoute, trainBonus, gradeFor, scorePercent,
   inputLog, sfx, menuButtons, hudButtons, persist, STORE_KEY,

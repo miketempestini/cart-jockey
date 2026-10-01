@@ -1,4 +1,4 @@
-# Lot Runner
+# Cart Jockey
 
 A small browser game about wrangling shopping carts across a parking lot before your shift ends.
 

@@ -19,7 +19,7 @@ const CONFIG = {
   // Energy drinks (chapters 3-5): walk over one for unlimited sprint. Another
   // one while boosted adds its time on top.
   drinkBoost: 30, // seconds of unlimited sprint per drink
-  drinkPickup: 18, // player center to drink center
+  drinkPickup: 18, // player center to a pickup's center (drinks, coupons, vests)
   drinkSpawnFrac: 0.3, // never closer to the start than this share of the world's diagonal
   grabRange: 44, // empty-handed: max distance from player center to a cart center
   latchRange: 34, // with a train: max distance from the hitch at the nose to a cart center
@@ -37,7 +37,18 @@ const CONFIG = {
   hitch: 8, // cart center to the hitch point at its nose; nested carts sit 2 * hitch apart
   linkSettleRate: 10, // how fast a newly grabbed or latched cart snaps into its nested spot
   binCartSpeed: 80, // how fast carts in the bin slide forward to fill a gap
-  cartValue: { standard: 10, stray: 20 },
+  cartValue: { standard: 10, stray: 20, golden: 50 },
+  // Shopper requests (every chapter): now and then a shopper waits by the
+  // doors for a cart. Hand them one from your train for a tip.
+  requestFirst: [15, 25], // seconds into the shift before the first request
+  requestEvery: [30, 45], // seconds between requests
+  requestWait: 20, // how long they wait before giving up
+  requestTip: 25,
+  requestReach: 46, // player or a train cart this close to the shopper
+  // Golden cart (chapter 4+): once a shift, far away, gone after a while
+  // unless latched.
+  goldenLife: 30,
+  goldenSpawnAt: [0.25, 0.6], // share of the shift gone when it appears
   messageTime: 1.6,
   // Scoring. A dock pays (sum of cart values) x train bonus x combo.
   // The train bonus grows with every cart, so one big dock always beats the
@@ -519,6 +530,14 @@ const CHAPTERS = [
   },
 ];
 
+// The chapter each gameplay element first appears in (in both modes). Story
+// shows a one-time card for each the first time it's reached, in this order.
+const UNLOCKS = { requests: 1, coupon: 2, vest: 3, drinks: 3, golden: 4 };
+const INTRO_ORDER = ['requests', 'coupon', 'vest', 'drinks', 'golden'];
+function unlocked(feature) {
+  return LEVEL.chapter >= UNLOCKS[feature];
+}
+
 // ---- Levels -----------------------------------------------------------------
 //
 // One row per level. Inside a chapter, level 1 is the quietest (fewest cars
@@ -657,6 +676,8 @@ function makePlayer() {
     exhausted: false,
     regenDelay: 0,
     boost: 0, // seconds of unlimited sprint left from energy drinks
+    vest: false, // wearing a safety vest: the next car hit is blocked
+    shieldHit: false, // the current invulnerability came from the vest, not a real hit
     invuln: 0,
     stun: 0,
     // Carts being pushed, nearest the player first. Each link is
@@ -694,7 +715,7 @@ function loadSaved() {
     highScore: 0,
     bestComboLevel: 0,
     muted: false,
-    drinkIntroSeen: false, // the energy drink explainer has been shown in Story
+    introsSeen: {}, // feature id -> true once its Story explainer card was shown
     story: { unlocked: 1, completed: false, bests: {} },
     free: { bests: {} },
   };
@@ -706,7 +727,10 @@ function loadSaved() {
         saved.bestComboLevel = Math.min(Math.max(0, raw.bestComboLevel), CONFIG.comboMults.length - 1);
       }
       saved.muted = raw.muted === true;
-      saved.drinkIntroSeen = raw.drinkIntroSeen === true;
+      if (raw.introsSeen && typeof raw.introsSeen === 'object') {
+        for (const id of INTRO_ORDER) if (raw.introsSeen[id] === true) saved.introsSeen[id] = true;
+      }
+      if (raw.drinkIntroSeen === true) saved.introsSeen.drinks = true; // older saves
       if (raw.story && typeof raw.story === 'object') {
         if (Number.isInteger(raw.story.unlocked)) saved.story.unlocked = Math.min(Math.max(1, raw.story.unlocked), LEVELS.length);
         saved.story.completed = raw.story.completed === true;
@@ -753,7 +777,14 @@ const state = {
   strayTimer: CONFIG.strayRespawn,
   nextCartId: 1,
   carts: [], // status: 'inBin' | 'loose' | 'train'
-  drinks: [], // energy drinks still in the lot: { x, y } centers; none come back during a shift
+  pickups: [], // items still in the lot: { kind: 'drink' | 'coupon' | 'vest', x, y }; none come back during a shift
+  pickupKinds: [], // every item placed this shift, for the HUD tray
+  coupon: false, // holding a double-points coupon for the next dock
+  request: null, // a shopper waiting by the doors for a cart: { look, x, y, t, ... }
+  requestTimer: 0, // until the next request
+  golden: null, // the shift's golden cart: { cartId, t (seconds left while unlatched), latched }
+  goldenAt: -1, // shift clock reading when the golden cart appears (-1: none this shift)
+  introQueue: [], // Story explainer cards still to show before this shift
   parked: new Map(), // space id -> { color }
   reserved: new Set(), // space ids a moving car is heading into or backing out of
   traffic: [], // cars driving to or from spaces
@@ -799,14 +830,15 @@ function fxDock(carts, comboUp) {
   const n = carts.length;
   let text = null;
   if (comboUp) text = `COMBO ${comboMult()}x!`;
+  else if (carts.some((c) => c.kind === 'golden')) text = 'GOLDEN CART!';
   else if (n >= 5) text = 'HUGE TRAIN!';
   else if (n >= 3) text = 'NICE TRAIN!';
   else if (carts.some((c) => c.kind === 'stray')) text = 'STRAY SAVED!';
   if (text) fx.sticker = { text, t: 0 };
 }
 
-function fxDrink(at) {
-  fx.sticker = { text: 'ENERGY!', t: 0 };
+function fxPickup(at, text) {
+  fx.sticker = { text, t: 0 };
   for (let i = 0; i < 8; i++) {
     const a = (i / 8) * Math.PI * 2;
     fx.puffs.push({ x: at.x + Math.cos(a) * 12, y: at.y + Math.sin(a) * 6, t: 0, life: 0.5 + Math.random() * 0.3 });
@@ -887,11 +919,13 @@ function spawnStray() {
   return makeCart('stray', spot.x, spot.y, spot.angle + jitter, 'loose');
 }
 
-// Energy drinks for this shift, in new spots every time: about half off the
-// road (sidewalk, painted islands, lot edges) and the rest out on open
-// asphalt (lanes, empty stalls). All far from the start and spread apart, so
-// they take some hunting. A drink under a car that parks later stays put.
-function placeDrinks(count) {
+// Pickups for this shift (energy drinks, the coupon, the vest), in new spots
+// every time: about half off the road (sidewalk, painted islands, lot edges)
+// and the rest out on open asphalt (lanes, empty stalls). All far from the
+// start and spread apart, so they take some hunting. One under a car that
+// parks later stays put.
+function placePickups(kinds) {
+  const count = kinds.length;
   if (!count) return [];
   const start = LOT.playerStart;
   const minStart = CONFIG.drinkSpawnFrac * Math.hypot(LOT.width, LOT.height);
@@ -915,7 +949,7 @@ function placeDrinks(count) {
     let pool = pools[i % 2 ? 'road' : 'off'];
     if (!pool.length) pool = pools[i % 2 ? 'off' : 'road'];
     if (!pool.length) break;
-    // Farthest from the drinks so far, with some randomness: any spot at
+    // Farthest from the pickups so far, with some randomness: any spot at
     // least 65% as far apart as the best one.
     let pick;
     if (!chosen.length) pick = pool[Math.floor(rng() * pool.length)];
@@ -924,16 +958,17 @@ function placeDrinks(count) {
       const good = pool.filter((pt) => gap(pt) >= best * 0.65);
       pick = good[Math.floor(rng() * good.length)];
     }
-    chosen.push({ x: pick.x, y: pick.y });
+    chosen.push({ kind: kinds[i], x: pick.x, y: pick.y });
     for (const k of ['off', 'road']) pools[k] = pools[k].filter((pt) => pt !== pick);
   }
   return chosen;
 }
 
-// Does this level start with the energy drink explainer? Only the first
-// time Story reaches a chapter with drinks.
-function needsDrinkIntro() {
-  return state.mode === 'story' && CHAPTERS[LEVEL.chapter - 1].drinks > 0 && !state.saved.drinkIntroSeen;
+// Explainer cards this Story shift should open with: every unlocked feature
+// not seen yet, oldest first.
+function introsDue() {
+  if (state.mode !== 'story') return [];
+  return INTRO_ORDER.filter((id) => unlocked(id) && !state.saved.introsSeen[id]);
 }
 
 // Switch to level n (1-25): its chapter's map and its traffic, shopper and
@@ -945,7 +980,8 @@ function loadLevel(n, mode = state.mode) {
   LOT = buildLot(CHAPTERS[LEVEL.chapter - 1].layout);
   rebuildPedGrid();
   resetSession();
-  if (needsDrinkIntro()) setPhase('drinkIntro'); // the countdown waits behind it
+  state.introQueue = introsDue();
+  if (state.introQueue.length) setPhase('intro'); // the countdown waits behind it
 }
 
 // Start a fresh shift.
@@ -989,7 +1025,16 @@ function resetSession() {
   for (let i = 0; i < LOT.binCapacity; i++) spawnCartInBin();
   for (let i = 0; i < LEVEL.strays; i++) spawnStray();
   rng = Math.random;
-  state.drinks = placeDrinks(CHAPTERS[LEVEL.chapter - 1].drinks);
+  const kinds = Array(CHAPTERS[LEVEL.chapter - 1].drinks).fill('drink');
+  if (unlocked('coupon')) kinds.push('coupon');
+  if (unlocked('vest')) kinds.push('vest');
+  state.pickups = placePickups(kinds);
+  state.pickupKinds = state.pickups.map((pk) => pk.kind);
+  state.coupon = false;
+  state.request = null;
+  state.requestTimer = randBetween(CONFIG.requestFirst);
+  state.golden = null;
+  state.goldenAt = unlocked('golden') ? CONFIG.shiftSeconds * (1 - randBetween(CONFIG.goldenSpawnAt)) : -1;
 
   // Hold everything for "3, 2, 1, GO" before the clock starts.
   setPhase('countdown');
@@ -1113,10 +1158,12 @@ function pressAction(action, source = 'keyboard') {
     loadLevel(n, state.selectMode);
     return;
   }
-  if (action === 'drinkGo' && phase === 'drinkIntro') {
-    state.saved.drinkIntroSeen = true;
+  if (action === 'introNext' && phase === 'intro') {
+    const id = state.introQueue.shift();
+    if (id) state.saved.introsSeen[id] = true;
     persist();
-    setPhase('countdown');
+    if (state.introQueue.length) setPhase('intro');
+    else setPhase('countdown');
     return;
   }
   if (action === 'howto' && phase === 'title') return setPhase('howto');
@@ -1129,7 +1176,7 @@ function pressAction(action, source = 'keyboard') {
     else if (phase === 'howto' || phase === 'mode') setPhase('title');
     else if (phase === 'levels') setPhase('mode');
     else if (phase === 'complete') pressAction('levels', source);
-    else if (phase === 'drinkIntro') pressAction('drinkGo', source);
+    else if (phase === 'intro') pressAction('introNext', source);
     return;
   }
 
@@ -1204,8 +1251,8 @@ function menuButtons() {
       ];
     case 'howto':
       return [{ label: 'Back', action: 'title', x: bx, y: 440, w: bw, h: bh }];
-    case 'drinkIntro':
-      return [{ label: "Let's go!", action: 'drinkGo', primary: true, x: bx, y: 426, w: bw, h: bh }];
+    case 'intro':
+      return [{ label: state.introQueue.length > 1 ? `Next  \u00b7  ${state.introQueue.length - 1} more` : "Let's go!", action: 'introNext', primary: true, x: bx, y: 426, w: bw, h: bh }];
     case 'paused':
       return [
         { label: 'Resume', action: 'resume', x: bx, y: 206, w: bw, h: bh },
@@ -1725,6 +1772,12 @@ const sfx = (() => {
       tone('sawtooth', 392, 0, 0.35, 0.12);
       tone('sawtooth', 494, 0, 0.35, 0.1);
     }),
+    // Coupon, vest, a request or the golden cart: a bright two-note chime.
+    chime: () => play('chime', () => {
+      tone('triangle', 988, 0, 0.12, 0.25);
+      tone('triangle', 1319, 0.09, 0.22, 0.25);
+      tone('sine', 1976, 0.09, 0.2, 0.08);
+    }),
     // Energy drink: a can pop and a rising zing.
     slurp: () => play('slurp', () => {
       noise(0, 0.06, 0.6, 3200);
@@ -1942,6 +1995,7 @@ function attachCart(cart, anchor) {
   });
   cart.status = 'train';
   delete cart.lane;
+  if (cart.kind === 'golden' && state.golden) state.golden.latched = true;
   if (!pointIn(cc, LOT.corralArea)) state.freshPickup = true;
   state.best.train = Math.max(state.best.train, p.train.length);
   sfx.clank();
@@ -1963,6 +2017,11 @@ function interact() {
   const nose = carts[carts.length - 1];
   if (cartInReturnZone(nose)) {
     dockTrain();
+    return;
+  }
+
+  if (requestInReach()) {
+    handOverCart();
     return;
   }
 
@@ -2015,7 +2074,10 @@ function dockTrain() {
   const base = carts.reduce((sum, c) => sum + CONFIG.cartValue[c.kind], 0);
   const bonus = trainBonus(n);
   const mult = comboMult();
-  const points = Math.round(base * bonus * mult);
+  const coupon = state.coupon;
+  state.coupon = false;
+  const points = Math.round(base * bonus * mult * (coupon ? 2 : 1));
+  if (coupon) fx.sticker = { text: 'DOUBLE POINTS!', t: 0 };
   const standardCount = carts.filter((c) => c.kind === 'standard').length;
 
   const ids = new Set(carts.map((c) => c.id));
@@ -2025,6 +2087,7 @@ function dockTrain() {
   state.docked += n;
   const parts = [n > 1 ? `${n}-cart train x${bonus}` : '1 cart'];
   if (mult > 1) parts.push(`${mult}x combo`);
+  if (coupon) parts.push('2x coupon');
   showMessage(`+${points}  ${parts.join(', ')}`);
   sfx.dock(state.combo.level);
   // Bin carts go back to the bin; strays reappear on their own timer.
@@ -2163,18 +2226,164 @@ function updatePlayer(dt) {
   moveGroup([p], dx * speed * dt, dy * speed * dt);
 }
 
-// Walking over an energy drink drinks it: 30 more seconds of unlimited sprint.
-function updateDrinks() {
+// Walking over a pickup takes it. Energy drink: 30 more seconds of unlimited
+// sprint. Coupon: the next dock scores double. Vest: the next car hit is blocked.
+function updatePickups() {
   const p = state.player;
   const pc = center(p);
-  const left = state.drinks.filter((d) => Math.hypot(d.x - pc.x, d.y - pc.y) > CONFIG.drinkPickup);
-  const got = state.drinks.length - left.length;
-  if (!got) return;
-  state.drinks = left;
-  p.boost += CONFIG.drinkBoost * got;
-  fxDrink(pc);
-  sfx.slurp();
-  showMessage(`ENERGY DRINK! Unlimited sprint ${Math.ceil(p.boost)}s`);
+  const got = state.pickups.filter((d) => Math.hypot(d.x - pc.x, d.y - pc.y) <= CONFIG.drinkPickup);
+  if (!got.length) return;
+  state.pickups = state.pickups.filter((d) => !got.includes(d));
+  for (const d of got) {
+    if (d.kind === 'drink') {
+      p.boost += CONFIG.drinkBoost;
+      fxPickup(pc, 'ENERGY!');
+      sfx.slurp();
+      showMessage(`ENERGY DRINK! Unlimited sprint ${Math.ceil(p.boost)}s`);
+    } else if (d.kind === 'coupon') {
+      state.coupon = true;
+      fxPickup(pc, 'COUPON!');
+      sfx.chime();
+      showMessage('COUPON! Your next dock scores double');
+    } else if (d.kind === 'vest') {
+      p.vest = true;
+      fxPickup(pc, 'SAFETY VEST!');
+      sfx.chime();
+      showMessage('SAFETY VEST! Blocks the next car hit');
+    }
+  }
+}
+
+// ---- Shopper requests -------------------------------------------------------
+//
+// Now and then a shopper comes out and waits on the sidewalk beside the doors
+// with a "Need a cart!" bubble. Bring your train close and press Grab to hand
+// over a cart (the one at the nose, never the golden one) for a tip. After a
+// while they give up and go back in.
+
+// A free spot on the sidewalk beside the doors, away from the corral.
+function requestSpot() {
+  const door = LOT.doorPoint;
+  const sideToCorral = Math.sign(LOT.corral.x + LOT.corral.w / 2 - door.x) || 1;
+  const off = LOT.doors.w / 2 + 34;
+  const blockers = [...LOT.staticSolids, LOT.corralArea, state.player, ...state.carts, ...shopperBodies()];
+  for (const side of [-sideToCorral, sideToCorral]) {
+    const spot = { x: door.x + side * off, y: door.y };
+    if (!blockers.some((b) => overlaps(b, shopperBox(spot)))) return spot;
+  }
+  return null;
+}
+
+function updateRequests(dt) {
+  const r = state.request;
+  if (r) {
+    r.t -= dt;
+    if (r.t <= 0) {
+      // Gave up: head back inside empty-handed.
+      state.request = null;
+      sendInside(r, null);
+      showMessage('The shopper gave up waiting for a cart');
+    }
+    return;
+  }
+  state.requestTimer -= dt;
+  if (state.requestTimer > 0) return;
+  state.requestTimer = randBetween(CONFIG.requestEvery);
+  const spot = requestSpot();
+  if (!spot) return;
+  state.request = { look: makeLook(), x: spot.x, y: spot.y, t: CONFIG.requestWait, id: -1, fx: 0, fy: 1, walked: 0, moving: false, cartId: null };
+  sfx.chime();
+  showMessage('A shopper by the doors needs a cart!');
+}
+
+// The waiting shopper walks back in through the doors, pushing `cart` if
+// they got one (it disappears with them).
+function sendInside(r, cart) {
+  const sh = makeShopper(r.look, { x: r.x, y: r.y }, 'toStore', { request: true, fx: r.fx, fy: r.fy });
+  if (cart) sh.cartId = cart.id;
+  if (!setGoal(sh, { ...LOT.doorPoint })) {
+    sh.gone = true;
+    if (cart) state.carts = state.carts.filter((c) => c !== cart);
+  }
+}
+
+function requestInReach() {
+  const r = state.request;
+  const p = state.player;
+  if (!r || !p.train.length) return false;
+  const near = (pt) => Math.hypot(pt.x - r.x, pt.y - r.y) <= CONFIG.requestReach;
+  return near(center(p)) || trainCarts().some((c) => near(center(c)));
+}
+
+function handOverCart() {
+  const p = state.player;
+  let i = p.train.length - 1;
+  while (i >= 0 && cartById(p.train[i].cartId).kind === 'golden') i--;
+  if (i < 0) {
+    showMessage('Keep the golden cart for the corral!');
+    return;
+  }
+  const [link] = p.train.splice(i, 1);
+  const cart = cartById(link.cartId);
+  // The shopper takes it from where they stand.
+  const r = state.request;
+  state.request = null;
+  cart.status = 'shopper';
+  cart.angle = Math.PI / 2;
+  cart.x = r.x - CART_SIZE / 2;
+  cart.y = r.y + 17 - CART_SIZE / 2;
+  r.fx = 0;
+  r.fy = -1;
+  sendInside(r, cart);
+  if (cart.kind === 'standard') spawnCartInBin(); // it comes back out to the bin later
+  state.score += CONFIG.requestTip;
+  state.freshPickup = true;
+  fxPickup(center(p), `TIP +${CONFIG.requestTip}!`);
+  sfx.dock(0);
+  showMessage(`+${CONFIG.requestTip} tip! "Thanks, you're a lifesaver!"`);
+}
+
+// ---- Golden cart --------------------------------------------------------------
+
+// Put the golden cart on a free stray spot far from the player.
+function spawnGolden() {
+  const pc = center(state.player);
+  const bodies = [state.player, ...state.carts, ...vehicleBoxes()];
+  const open = straySpotsNow().filter((sp) => !bodies.some((b) => overlaps(b, { x: sp.x, y: sp.y, w: CART_SIZE, h: CART_SIZE })));
+  if (!open.length) return false;
+  const dist = (sp) => Math.hypot(sp.x + CART_SIZE / 2 - pc.x, sp.y + CART_SIZE / 2 - pc.y);
+  const far = Math.max(...open.map(dist));
+  const good = open.filter((sp) => dist(sp) >= far * 0.7);
+  const spot = good[Math.floor(Math.random() * good.length)];
+  const cart = makeCart('golden', spot.x, spot.y, spot.angle + (Math.random() - 0.5) * 0.6, 'loose');
+  state.golden = { cartId: cart.id, t: CONFIG.goldenLife, latched: false };
+  fx.sticker = { text: 'GOLDEN CART!', t: 0 };
+  sfx.chime();
+  showMessage(`A golden cart appeared! Latch it within ${CONFIG.goldenLife}s`);
+  return true;
+}
+
+function updateGolden(dt) {
+  if (state.goldenAt >= 0 && state.timeLeft <= state.goldenAt) {
+    if (spawnGolden() || state.timeLeft < 30) state.goldenAt = -1; // no room: try again next frame
+  }
+  const g = state.golden;
+  if (!g || g.latched) return;
+  const cart = cartById(g.cartId);
+  if (!cart) {
+    state.golden = null;
+    return;
+  }
+  g.t -= dt;
+  if (g.t <= 0 && cart.status === 'loose') {
+    state.carts = state.carts.filter((c) => c !== cart);
+    state.golden = null;
+    for (let i = 0; i < 6; i++) {
+      const a = Math.random() * Math.PI * 2;
+      fx.puffs.push({ x: cart.x + 10 + Math.cos(a) * 10, y: cart.y + 14 + Math.sin(a) * 5, t: 0, life: 0.6 });
+    }
+    showMessage('The golden cart rolled away!');
+  }
 }
 
 // Carts in the bin slide toward the open end to fill any gap, but stop
@@ -2385,6 +2594,19 @@ function knockAside(body, car) {
 
 function hitByCar(car) {
   const p = state.player;
+  if (p.vest) {
+    // The vest takes the hit: keep the train, the time and the combo. The car
+    // gets a moment to drive past.
+    p.vest = false;
+    p.invuln = CONFIG.hitInvuln;
+    p.shieldHit = true;
+    sfx.honk();
+    fxHonk(car);
+    fx.sticker = { text: 'VEST SAVED YOU!', t: 0 };
+    showMessage('The safety vest took the hit! Train, time and combo safe');
+    return;
+  }
+  p.shieldHit = false;
   const box = vehicleBox(car);
   const dropped = trainCarts();
   for (const cart of dropped) cart.status = 'loose';
@@ -2791,6 +3013,7 @@ function finishLeg(sh) {
   const cart = sh.cartId ? cartById(sh.cartId) : null;
   if (sh.mode === 'toStore') {
     if (entry) entry.ownerInside = true;
+    if (cart) state.carts = state.carts.filter((c) => c !== cart); // a requested cart goes in with them
     sh.gone = true;
     return;
   }
@@ -2861,6 +3084,10 @@ function updateShopper(sh, dt) {
     sh.stuck += dt;
     sh.sinceReplan += dt;
     const nearCorral = sh.cartId && pointIn(center(cartById(sh.cartId)), LOT.corralArea);
+    if (sh.request && sh.stuck > SHOPPER_PATIENCE) {
+      finishLeg(sh); // a few steps from the door: count them as in
+      return;
+    }
     if (sh.stuck > SHOPPER_PATIENCE && sh.cartId && !nearCorral) {
       // Fed up: leave the cart right here and head for the car.
       const cart = cartById(sh.cartId);
@@ -3024,7 +3251,9 @@ function update(dt) {
   if (state.phase !== 'playing') return;
   state.goFlash = Math.max(0, state.goFlash - dt);
   updatePlayer(dt);
-  updateDrinks();
+  updatePickups();
+  updateRequests(dt);
+  updateGolden(dt);
   updateVehicles(dt);
   updateShoppers(dt);
   updateBin(dt);
@@ -3124,6 +3353,7 @@ const COLORS = {
   stamina: '#5fd068',
   staminaLow: '#e0593f',
 };
+const VEST_ORANGE = '#ff8a1f';
 
 function fillRect(r, color) {
   ctx.fillStyle = color;
@@ -3551,11 +3781,11 @@ function drawStore() {
 }
 
 // A flat little cart icon for signs and the UI.
-function drawCartIcon(x, y, s, smile) {
+function drawCartIcon(x, y, s, smile, basket = COLORS.cartTop) {
   ctx.save();
   ctx.translate(x, y);
   ctx.scale(s, s);
-  rr(-12, -9, 20, 13, 4, COLORS.cartTop, COLORS.outline, 2);
+  rr(-12, -9, 20, 13, 4, basket, COLORS.outline, 2);
   ctx.strokeStyle = COLORS.cartHandle;
   ctx.lineWidth = 3;
   ctx.lineCap = 'round';
@@ -3684,10 +3914,11 @@ function drawCartProp(cx, cy, angle, kind, opts = {}) {
     ctx.quadraticCurveTo(-9, -8, -7, -8);
     ctx.closePath();
   };
-  block(cx, cy - (3 + lift) * s, angle, 8, COLORS.cartSide, COLORS.cartTop, basket, s);
+  const golden = kind === 'golden';
+  block(cx, cy - (3 + lift) * s, angle, 8, golden ? '#dea21f' : COLORS.cartSide, golden ? '#ffd84d' : COLORS.cartTop, basket, s);
   inFrame(cx, cy, angle, s, 11 + lift, () => {
     // Wire grid on the top
-    ctx.strokeStyle = COLORS.cartGrid;
+    ctx.strokeStyle = golden ? '#c98a12' : COLORS.cartGrid;
     ctx.lineWidth = 1.2;
     for (const gx of [-4, 0, 3]) {
       ctx.beginPath();
@@ -3711,6 +3942,14 @@ function drawCartProp(cx, cy, angle, kind, opts = {}) {
       ctx.stroke();
     }
   });
+  // Golden: twinkling sparkles around it
+  if (golden) {
+    for (let i = 0; i < 3; i++) {
+      const a = fx.time * 1.6 + (i * Math.PI * 2) / 3;
+      const tw = 0.5 + 0.5 * Math.sin(fx.time * 7 + i * 2);
+      drawStar(cx + Math.cos(a) * 15 * s, cy - 12 * s + Math.sin(a) * 8 * s, 2 + 2.5 * tw, '#fff6c2');
+    }
+  }
   ctx.restore();
 }
 
@@ -3720,7 +3959,7 @@ function drawPlayerProp() {
   const moving = fx.speed > 8;
   const sprint = p.sprinting && moving;
   const hitAge = CONFIG.hitInvuln - p.invuln;
-  const sitting = p.invuln > 0 && hitAge < 0.8;
+  const sitting = p.invuln > 0 && hitAge < 0.8 && !p.shieldHit;
   drawAttendant({
     x: c.x,
     y: c.y + 4,
@@ -3734,12 +3973,13 @@ function drawPlayerProp() {
     sitting,
     hitAge,
     faded: p.invuln > 0 && !sitting && Math.floor(p.invuln * 10) % 2 === 0,
+    hiVis: p.vest,
   });
 }
 
 // The cart attendant, standing on (x, y), facing (fxd, fyd). Shared by the
 // player in the lot and the mascot on the title screen.
-function drawAttendant({ x, y, s, fxd, fyd, moving, sprint, step, pushing, sitting, hitAge, faded }) {
+function drawAttendant({ x, y, s, fxd, fyd, moving, sprint, step, pushing, sitting, hitAge, faded, hiVis }) {
   const px = -fyd; // perpendicular (to the facing's right)
   const py = fxd;
   const stride = moving ? (sprint ? 5 : 3) : 0;
@@ -3784,9 +4024,11 @@ function drawAttendant({ x, y, s, fxd, fyd, moving, sprint, step, pushing, sitti
   // Body: white shirt under a teal vest with a reflective stripe
   const by = -12 - bob;
   rr(-8, by - 3, 16, 17, 7, COLORS.shirt, COLORS.outline, 2);
-  rr(-8, by, 16, 12, 5, COLORS.vest, COLORS.outline, 1.5);
-  ctx.fillStyle = COLORS.gold;
+  // Wearing the safety vest power-up: hi-vis orange with silver stripes
+  rr(-8, by, 16, 12, 5, hiVis ? VEST_ORANGE : COLORS.vest, COLORS.outline, 1.5);
+  ctx.fillStyle = hiVis ? '#e8eef5' : COLORS.gold;
   ctx.fillRect(-7, by + 5, 14, 2.5);
+  if (hiVis) ctx.fillRect(-7, by + 9, 14, 1.8);
   if (fyd > -0.4) {
     // Name tag on the chest
     rr(-2 + px * 3 + fxd * 2, by + 1, 6, 4, 1, '#ffffff', COLORS.outline, 0.8);
@@ -4006,21 +4248,117 @@ function drawRail(r, height, flash) {
   });
 }
 
-// A drink in the lot: bobbing a little over its shadow with a soft glow,
+// The double-points coupon: a tilted ticket with a dashed border and "2x".
+// (x, y) at the bottom center, s = scale (1 is about 20x13).
+function drawCouponIcon(x, y, s) {
+  ctx.save();
+  ctx.translate(x, y - 7 * s);
+  ctx.scale(s, s);
+  ctx.rotate(-0.15);
+  rr(-10, -6.5, 20, 13, 2.5, '#ff7ab8', COLORS.outline, 1.8);
+  ctx.setLineDash([2, 1.6]);
+  rr(-7.5, -4, 15, 8, 1.5, null, '#fff6e2', 1);
+  ctx.setLineDash([]);
+  ctx.font = `900 7.5px ${FONT}`;
+  ctx.fillStyle = '#fff6e2';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('2x', 0, 0.5);
+  ctx.restore();
+}
+
+// The safety vest: a little hi-vis orange vest with silver stripes.
+// (x, y) at the bottom center, s = scale (1 is about 16x16).
+function drawVestIcon(x, y, s) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(s, s);
+  ctx.beginPath();
+  ctx.moveTo(-8, -1);
+  ctx.lineTo(-8, -10);
+  ctx.lineTo(-4, -16);
+  ctx.lineTo(-1.5, -16);
+  ctx.lineTo(0, -10);
+  ctx.lineTo(1.5, -16);
+  ctx.lineTo(4, -16);
+  ctx.lineTo(8, -10);
+  ctx.lineTo(8, -1);
+  ctx.quadraticCurveTo(8, 0, 7, 0);
+  ctx.lineTo(-7, 0);
+  ctx.quadraticCurveTo(-8, 0, -8, -1);
+  ctx.closePath();
+  ctx.fillStyle = VEST_ORANGE;
+  ctx.fill();
+  ctx.strokeStyle = COLORS.outline;
+  ctx.lineWidth = 1.6;
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+  ctx.fillStyle = '#e8eef5';
+  ctx.fillRect(-7.2, -8, 14.4, 2);
+  ctx.fillRect(-7.2, -4.5, 14.4, 2);
+  ctx.restore();
+}
+
+const PICKUP_LOOK = {
+  drink: { glow: '182, 240, 60', draw: drawDrinkCan },
+  coupon: { glow: '255, 122, 184', draw: drawCouponIcon },
+  vest: { glow: '255, 140, 40', draw: drawVestIcon },
+};
+
+// A pickup in the lot: bobbing a little over its shadow with a soft glow,
 // so it stands out once it's on screen.
-function drawDrinkProp(d) {
+function drawPickupProp(d) {
+  const look = PICKUP_LOOK[d.kind];
   const s = depthScale(d.y);
   const bob = Math.sin(fx.time * 4 + d.x * 0.05) * 2.5;
   const glow = 0.35 + 0.2 * Math.sin(fx.time * 6 + d.y);
   const g = ctx.createRadialGradient(d.x, d.y - 8, 2, d.x, d.y - 8, 22);
-  g.addColorStop(0, `rgba(182, 240, 60, ${glow})`);
-  g.addColorStop(1, 'rgba(182, 240, 60, 0)');
+  g.addColorStop(0, `rgba(${look.glow}, ${glow})`);
+  g.addColorStop(1, `rgba(${look.glow}, 0)`);
   ctx.fillStyle = g;
   ctx.beginPath();
   ctx.arc(d.x, d.y - 8, 22, 0, Math.PI * 2);
   ctx.fill();
   groundShadow(d.x, d.y + 2, 7 * s, 3 * s);
-  drawDrinkCan(d.x, d.y - 3 + bob, s);
+  look.draw(d.x, d.y - 3 + bob, s);
+}
+
+// A speech bubble over a world point, with a ring that drains as `frac` runs out.
+function drawBubble(x, y, label, frac, fill = COLORS.cream) {
+  ctx.font = `900 11px ${FONT}`;
+  const w = ctx.measureText(label).width + 34;
+  const bx = x - w / 2, by = y - 22;
+  rr(bx, by + 3, w, 22, 11, 'rgba(59, 43, 43, 0.25)');
+  rr(bx, by, w, 22, 11, fill, COLORS.outline, 2);
+  ctx.beginPath();
+  ctx.moveTo(x - 5, by + 21);
+  ctx.lineTo(x, by + 28);
+  ctx.lineTo(x + 5, by + 21);
+  ctx.fillStyle = fill;
+  ctx.fill();
+  ctx.strokeStyle = COLORS.outline;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  text(label, bx + 10, by + 11.5, 11, COLORS.ink, 'left');
+  const rx = bx + w - 13, ry = by + 11;
+  circle(rx, ry, 6, COLORS.creamDark);
+  ctx.beginPath();
+  ctx.moveTo(rx, ry);
+  ctx.arc(rx, ry, 6, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.max(0, frac));
+  ctx.closePath();
+  ctx.fillStyle = frac < 0.3 ? COLORS.tomato : COLORS.teal;
+  ctx.fill();
+  circle(rx, ry, 6, null, COLORS.outline, 1.2);
+}
+
+// The shopper waiting for a cart, waving, with their bubble and timer.
+function drawRequestProp(r) {
+  drawShopperProp(r);
+  const s = depthScale(r.y);
+  const wave = Math.sin(fx.time * 9) * 3;
+  circle(r.x + 9 * s, r.y - 26 * s + wave * 0.3, 3 * s, r.look.skin, COLORS.outline, 1.2);
+  const frac = r.t / CONFIG.requestWait;
+  drawBubble(r.x, r.y - 34 * s + Math.sin(fx.time * 3) * 1.5, 'Need a cart!', frac);
 }
 
 function drawIslandProp(isl) {
@@ -4101,7 +4439,11 @@ function drawWorld() {
     const alpha = g.t < 0.35 ? 1 : Math.max(0, 1 - (g.t - 0.35) / 0.4);
     add(g.y + 10, () => drawCartProp(g.x, g.y, g.angle, g.kind, { lift: 6 * (1 - settle), alpha }));
   }
-  for (const d of state.drinks) add(d.y + 2, () => drawDrinkProp(d), d.x, d.y);
+  for (const d of state.pickups) add(d.y + 2, () => drawPickupProp(d), d.x, d.y);
+  if (state.request) {
+    const r = state.request;
+    add(r.y + CONFIG.shopperSize / 2, () => drawRequestProp(r), r.x, r.y);
+  }
   add(state.player.y + state.player.h, drawPlayerProp);
   for (const sh of state.shoppers) add(sh.y + CONFIG.shopperSize / 2, () => drawShopperProp(sh), sh.x, sh.y);
   for (const isl of LOT.islands) add(isl.y + isl.h, () => drawIslandProp(isl), isl.x + isl.w / 2, Math.max(isl.y, Math.min(isl.y + isl.h, cam.y + H / 2)));
@@ -4289,6 +4631,49 @@ function dim(alpha = 0.6) {
 
 // ---- HUD ------------------------------------------------------------------
 
+// Arrows at the screen edge pointing to a waiting shopper or an unlatched
+// golden cart when they're off screen (big lots only).
+function drawEdgeArrows() {
+  const targets = [];
+  if (state.request) targets.push([state.request, COLORS.teal]);
+  const g = state.golden;
+  if (g && !g.latched) {
+    const c = cartById(g.cartId);
+    if (c) targets.push([center(c), COLORS.gold]);
+  }
+  for (const [pt, color] of targets) {
+    const sx = pt.x - cam.x, sy = pt.y - cam.y;
+    if (sx > 0 && sx < W && sy > 0 && sy < H) continue;
+    // Clamp to a frame inside the HUD: below the top pills, above the bottom row.
+    const box = { x0: 40, x1: W - 40, y0: 150, y1: H - 70 };
+    const cx = W / 2, cy = (box.y0 + box.y1) / 2;
+    const a = Math.atan2(sy - cy, sx - cx);
+    const dx = Math.cos(a), dy = Math.sin(a);
+    const kx = dx > 0 ? (box.x1 - cx) / dx : dx < 0 ? (box.x0 - cx) / dx : Infinity;
+    const ky = dy > 0 ? (box.y1 - cy) / dy : dy < 0 ? (box.y0 - cy) / dy : Infinity;
+    const k = Math.min(kx, ky);
+    const ax = cx + dx * k, ay = cy + dy * k;
+    const pulse = 1 + Math.sin(fx.time * 6) * 0.12;
+    ctx.save();
+    ctx.translate(ax, ay);
+    ctx.rotate(a);
+    ctx.scale(pulse, pulse);
+    ctx.beginPath();
+    ctx.moveTo(14, 0);
+    ctx.lineTo(-8, -11);
+    ctx.lineTo(-3, 0);
+    ctx.lineTo(-8, 11);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.strokeStyle = COLORS.outline;
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
 function drawHud() {
   const p = state.player;
   const n = p.train.length;
@@ -4367,18 +4752,55 @@ function drawHud() {
     meter(46, sy + 10, 160, 14, p.stamina / CONFIG.staminaMax, p.exhausted ? COLORS.tomato : '#5fcf8a');
   }
 
-  // Energy drinks still out in the lot, on chapters that have them.
-  const total = CHAPTERS[LEVEL.chapter - 1].drinks;
-  if (total) {
-    const dw = 26 + total * 18;
-    pill(224, sy, dw, 34, COLORS.cream, 17);
-    for (let i = 0; i < total; i++) {
+  // Pickups this shift: lit while still out in the lot, faded once taken.
+  let tx = 224;
+  const kinds = state.pickupKinds;
+  if (kinds.length) {
+    const left = {};
+    for (const d of state.pickups) left[d.kind] = (left[d.kind] || 0) + 1;
+    const dw = 22 + kinds.length * 22;
+    pill(tx, sy, dw, 34, COLORS.cream, 17);
+    const seen = {};
+    kinds.forEach((k, i) => {
+      seen[k] = (seen[k] || 0) + 1;
       ctx.save();
-      ctx.globalAlpha = i < state.drinks.length ? 1 : 0.25;
-      drawDrinkCan(246 + i * 18, sy + 27, 0.95);
+      ctx.globalAlpha = seen[k] <= (left[k] || 0) ? 1 : 0.25;
+      PICKUP_LOOK[k].draw(tx + 22 + i * 22, sy + 27, k === 'coupon' ? 0.8 : 0.95);
       ctx.restore();
-    }
+    });
+    tx += dw + 6;
   }
+  // Under the level pill: held power-ups (the vest until a car hits, the
+  // coupon until a dock), then timed events (a waiting shopper, the golden cart).
+  let ey = 86;
+  const heldUps = [];
+  if (p.vest) heldUps.push(['vest', 'VEST ON', '#ffe2c4']);
+  if (state.coupon) heldUps.push(['coupon', '2x NEXT DOCK', '#ffdced']);
+  if (heldUps.length) {
+    let hx = 12;
+    for (const [k, label, fill] of heldUps) {
+      ctx.font = `900 11px ${FONT}`;
+      const hw = ctx.measureText(label).width + 44;
+      pill(hx, ey, hw, 24, fill, 12);
+      PICKUP_LOOK[k].draw(hx + 17, ey + 20, k === 'coupon' ? 0.7 : 0.8);
+      text(label, hx + 32, ey + 12.5, 11, COLORS.ink);
+      hx += hw + 6;
+    }
+    ey += 30;
+  }
+  const event = (label, secs, fill) => {
+    const str = `${label}  ${Math.ceil(secs)}s`;
+    ctx.font = `900 11px ${FONT}`;
+    const w = ctx.measureText(str).width + 26;
+    const blink = secs < 5 && Math.floor(fx.time * 6) % 2 === 0;
+    pill(12, ey, w, 24, blink ? COLORS.cream : fill, 12);
+    text(str, 25, ey + 12.5, 11, COLORS.ink);
+    ey += 30;
+  };
+  if (state.request) event('SHOPPER NEEDS A CART', state.request.t, '#c9f0e6');
+  const g = state.golden;
+  if (g && !g.latched) event('GOLDEN CART', g.t, '#ffe58a');
+  drawEdgeArrows();
 
   // Keyboard controls, bottom right. Touch players have the on-screen pad instead.
   if (!state.touchUi) {
@@ -4699,51 +5121,133 @@ function drawHowTo() {
     'Dock again within 12 seconds with freshly collected carts to climb the combo: 1.5x, 2x, 3x.',
     'Cars come and go all shift. A hit drops your whole train and costs 5 seconds.',
     `${touch ? 'DROP' : 'Q'} drops the last cart. ${touch ? 'The pause button' : 'Esc'} pauses. Grade is your score against par.`,
-    'From Chapter 3, hunt the lot for energy drinks: each gives 30 seconds of unlimited sprint.',
+    'Shoppers by the doors may ask for a cart: bring your train close and hand one over for a tip.',
+    'Power-ups: 2x coupon (Ch 2), safety vest + energy drinks (Ch 3), 50-point golden cart (Ch 4).',
   ];
   const dots = [COLORS.tomato, COLORS.gold, COLORS.teal, '#5b7fe0', '#ff8a70', '#b99af0', '#7ed9b0', '#ffb38a'];
   lines.forEach((line, i) => {
-    const y = 134 + i * 32;
+    const y = 130 + i * 30;
     circle(150, y, 6, dots[i % dots.length], COLORS.outline, 1.5);
-    text(line, 166, y, 14.5, COLORS.ink, 'left', 700);
+    text(line, 166, y, 14, COLORS.ink, 'left', 700);
   });
   drawMenuButtons();
 }
 
-// Shown once, the first time Story reaches Chapter 3: what the energy drink
-// is and how it works, with a big picture of it.
-function drawDrinkIntro() {
+// Story explainer cards, shown once each the first time Story reaches the
+// chapter where a new element appears: a big picture and a few short rules.
+const INTRO_CARDS = {
+  requests: {
+    title: 'NEW: CART REQUESTS!',
+    color: COLORS.teal,
+    picture: (cx, cy) => {
+      const look = { ...SHOPPER_DEMO_LOOK };
+      const r = { look, x: 0, y: 0, id: 0, fx: 0, fy: 1, walked: 0, moving: false, cartId: null };
+      ctx.save();
+      ctx.translate(cx, cy + 30);
+      ctx.scale(3.6, 3.6);
+      drawShopperProp(r);
+      ctx.restore();
+      drawBubble(cx, cy - 72, 'Need a cart!', 0.5 + 0.5 * Math.sin(fx.time));
+    },
+    lines: () => [
+      ['What', 'Now and then a shopper waits by the doors for a cart.'],
+      ['Help', `Bring your train close and press ${state.touchUi ? 'GRAB' : 'Space / E'} to hand one over.`],
+      ['Tip', `Every cart you hand over earns a +${CONFIG.requestTip} tip.`],
+      ['Hurry', `They wait ${CONFIG.requestWait} seconds, then give up and go inside.`],
+      ['Find', 'Look for the "Need a cart!" bubble and the HUD timer.'],
+    ],
+    note: 'They never take the golden cart. Bin carts you hand over come back to the bin.',
+  },
+  coupon: {
+    title: 'NEW: DOUBLE POINTS!',
+    color: '#ff7ab8',
+    picture: (cx, cy) => drawCouponIcon(cx, cy + 30 + Math.sin(fx.time * 3) * 4, 5.5),
+    lines: () => [
+      ['What', 'One double-points coupon hides in the lot each shift.'],
+      ['Grab', 'Walk over it to pick it up, with or without a train.'],
+      ['Effect', 'Your next dock scores double, on top of train and combo.'],
+      ['Tip', 'Save it for a long train in the middle of a combo!'],
+      ['Hunt', 'Far from where you start, in a new spot every shift.'],
+    ],
+    note: "The HUD shows '2x NEXT DOCK' while you're holding it.",
+  },
+  vest: {
+    title: 'NEW: SAFETY VEST!',
+    color: VEST_ORANGE,
+    picture: (cx, cy) => drawVestIcon(cx, cy + 40 + Math.sin(fx.time * 3) * 4, 6),
+    lines: () => [
+      ['What', 'One hi-vis safety vest hides in the lot each shift.'],
+      ['Grab', 'Walk over it to put it on. Your vest turns orange.'],
+      ['Effect', 'It blocks the next car hit: keep your train, time and combo.'],
+      ['Once', 'It is used up by that one hit, so stay careful after.'],
+      ['Hunt', 'Far from where you start, in a new spot every shift.'],
+    ],
+    note: "The HUD shows 'VEST ON' while you're wearing it.",
+  },
+  drinks: {
+    title: 'NEW: ENERGY DRINKS!',
+    color: '#b6f03c',
+    picture: (cx, cy) => drawDrinkCan(cx, cy + 34 + Math.sin(fx.time * 3) * 4, 6),
+    lines: () => [
+      ['What', 'Cans of energy hidden around the parking lot.'],
+      ['Grab', 'Walk over one to drink it, with or without a train.'],
+      ['Boost', `${CONFIG.drinkBoost}s of unlimited sprint: hold ${state.touchUi ? 'SPRINT' : 'Shift'}, no stamina used.`],
+      ['Stack', `Drink another while boosted for ${CONFIG.drinkBoost} more seconds.`],
+      ['Hunt', 'Far from where you start, in new spots every shift.'],
+      ['Count', 'Chapter 3 has 2, Chapter 4 has 3, Chapter 5 has 4. No refills!'],
+    ],
+    note: 'The HUD shows how many cans are left and your boost time.',
+  },
+  golden: {
+    title: 'NEW: GOLDEN CART!',
+    color: COLORS.gold,
+    picture: (cx, cy) => {
+      drawCartIcon(cx + 8, cy - 4 + Math.sin(fx.time * 3) * 3, 5, true, '#ffd84d');
+      for (let i = 0; i < 4; i++) {
+        const a = fx.time * 1.2 + (i * Math.PI) / 2;
+        const tw = 0.5 + 0.5 * Math.sin(fx.time * 6 + i * 2);
+        drawStar(cx + Math.cos(a) * 85, cy - 20 + Math.sin(a) * 55, 6 + 6 * tw, '#fff6c2');
+      }
+    },
+    lines: () => [
+      ['What', 'Once a shift, a shiny golden cart rolls into the lot.'],
+      ['Worth', `${CONFIG.cartValue.golden} points, times your train bonus and combo.`],
+      ['Hurry', `It rolls away after ${CONFIG.goldenLife} seconds unless you latch it.`],
+      ['Find', 'Follow the gold arrow at the screen edge and the minimap.'],
+      ['Safe', 'Once it is in your train, it stays until you dock it.'],
+    ],
+    note: 'It always shows up far from you. Run!',
+  },
+};
+const SHOPPER_DEMO_LOOK = { height: 1, girth: 1, top: '#5b7fe0', accent: '#ffc93c', skin: '#e0a37a', hair: '#3b2b2b', style: 'curly', glasses: false, tote: true };
+
+function drawIntro() {
+  const card = INTRO_CARDS[state.introQueue[0]];
+  if (!card) return;
   dim(0.55);
   awningCard(100, 56, W - 200, 438);
-  stickerText('NEW: ENERGY DRINKS!', W / 2, 104, 30, '#b6f03c');
+  stickerText(card.title, W / 2, 104, 30, card.color);
 
-  // The can, big, on a glowing burst
+  // The picture, big, on a glowing burst
   const cx = 232, cy = 270;
   const g = ctx.createRadialGradient(cx, cy - 40, 10, cx, cy - 40, 110);
-  g.addColorStop(0, 'rgba(182, 240, 60, 0.55)');
-  g.addColorStop(1, 'rgba(182, 240, 60, 0)');
+  g.addColorStop(0, `${card.color}88`);
+  g.addColorStop(1, `${card.color}00`);
   ctx.fillStyle = g;
   ctx.beginPath();
   ctx.arc(cx, cy - 40, 110, 0, Math.PI * 2);
   ctx.fill();
   groundShadow(cx, cy + 34, 44, 12);
-  drawDrinkCan(cx, cy + 34 + Math.sin(fx.time * 3) * 4, 6);
+  card.picture(cx, cy);
 
-  const lines = [
-    ['What', 'Cans of energy hidden around the parking lot.'],
-    ['Grab', 'Walk over one to drink it, with or without a train.'],
-    ['Boost', `${CONFIG.drinkBoost}s of unlimited sprint: hold ${state.touchUi ? 'SPRINT' : 'Shift'}, no stamina used.`],
-    ['Stack', `Drink another while boosted for ${CONFIG.drinkBoost} more seconds.`],
-    ['Hunt', 'Far from where you start, in new spots every shift.'],
-    ['Count', 'Chapter 3 has 2, Chapter 4 has 3, Chapter 5 has 4. No refills!'],
-  ];
+  const lines = card.lines();
   lines.forEach(([k, v], i) => {
     const y = 162 + i * 40;
-    rr(360, y - 12, 62, 24, 12, '#7c4dff', COLORS.outline, 1.5);
+    rr(360, y - 12, 62, 24, 12, COLORS.ink, COLORS.outline, 1.5);
     text(k.toUpperCase(), 391, y + 0.5, 11, COLORS.cream, 'center');
     text(v, 434, y, 14, COLORS.ink, 'left', 700);
   });
-  text('The HUD shows how many cans are left and your boost time.', W / 2, 404, 12.5, COLORS.tomatoDark, 'center', 800);
+  text(card.note, W / 2, 404, 12.5, COLORS.tomatoDark, 'center', 800);
   drawMenuButtons();
 }
 
@@ -5111,6 +5615,19 @@ function drawDebug() {
     ctx.strokeRect(r.x + 2.5, r.y + 2.5, r.w - 5, r.h - 5);
   }
 
+  // Pickups and a waiting shopper's hand-over reach
+  ctx.strokeStyle = '#4fd8ff';
+  for (const d of state.pickups) {
+    ctx.beginPath();
+    ctx.arc(d.x, d.y, CONFIG.drinkPickup, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  if (state.request) {
+    ctx.beginPath();
+    ctx.arc(state.request.x, state.request.y, CONFIG.requestReach, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
   // Every cart, free or in the train
   ctx.strokeStyle = '#ff4fd8';
   for (const cart of state.carts) ctx.strokeRect(cart.x + 0.5, cart.y + 0.5, cart.w - 1, cart.h - 1);
@@ -5308,6 +5825,11 @@ function drawMinimap() {
     circle(x0 + (c.x + 10) * k, y0 + (c.y + 10) * k, 1.6, c.kind === 'stray' ? COLORS.gold : '#ffffff');
   }
   for (const c of trainCarts()) circle(x0 + (c.x + 10) * k, y0 + (c.y + 10) * k, 1.8, '#ffffff');
+  // Blinking markers: a waiting shopper and the golden cart
+  const blinkOn = Math.floor(fx.time * 4) % 2 === 0;
+  if (state.request && blinkOn) circle(x0 + state.request.x * k, y0 + state.request.y * k, 3.2, COLORS.teal, COLORS.outline, 1);
+  const gc = state.golden && cartById(state.golden.cartId);
+  if (gc && gc.status !== 'train' && blinkOn) circle(x0 + (gc.x + 10) * k, y0 + (gc.y + 10) * k, 3.2, COLORS.gold, COLORS.outline, 1);
   const pc = center(state.player);
   circle(x0 + pc.x * k, y0 + pc.y * k, 3, COLORS.teal, COLORS.outline, 1);
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
@@ -5336,7 +5858,7 @@ function draw() {
   else if (phase === 'levels') drawLevelSelect();
   else if (phase === 'complete') drawStoryComplete();
   else if (phase === 'howto') drawHowTo();
-  else if (phase === 'drinkIntro') drawDrinkIntro();
+  else if (phase === 'intro') drawIntro();
   else if (phase === 'paused') drawPaused();
   else if (phase === 'over') drawTally();
   drawHudButtons();
@@ -5354,7 +5876,7 @@ function draw() {
 // the final stretch and muffled while paused. The end-of-shift receipt waits
 // for the shift-over jingle before the menu song comes back; the Story
 // complete screen keeps just its fanfare.
-const MENU_MUSIC_PHASES = new Set(['title', 'howto', 'mode', 'levels', 'drinkIntro']);
+const MENU_MUSIC_PHASES = new Set(['title', 'howto', 'mode', 'levels', 'intro']);
 const OVER_JINGLE_WAIT = 1.6; // seconds
 const musicPhase = { phase: null, since: 0 };
 function updateMusic(now) {
@@ -5394,5 +5916,5 @@ window.cartJockey = {
   spawnStray, spawnArrival, spawnDeparture, findRoute, trainBonus, gradeFor, scorePercent,
   inputLog, sfx, menuButtons, hudButtons, persist, STORE_KEY,
   spawnShopperFromStore, planWalk, makeLook, LAYOUTS, buildLot,
-  loadLevel, LEVELS, CHAPTERS, levelInfo, expandTemplate, endShift, PASS_PERCENT, placeDrinks,
+  loadLevel, LEVELS, CHAPTERS, levelInfo, expandTemplate, endShift, PASS_PERCENT, placePickups,
 };

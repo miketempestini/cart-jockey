@@ -29,8 +29,8 @@ const CONFIG = {
   trainSpeedBase: 0.85, // speed multiplier with one cart
   trainSpeedPerCart: 0.05, // lost per extra cart (6 carts = 0.60)
   turnRadiusBase: 22, // turning radius with one cart
-  turnRadiusPerCart: 12, // added per extra cart (6 carts = 82)
-  trailerLag: 22, // travel distance for a cart to close ~63% of its angle gap to the cart ahead
+  turnRadiusPerCart: 6, // added per extra cart (6 carts = 52)
+  trailerLag: 11, // travel distance for a cart to close ~63% of its angle gap to the cart ahead (lower = the nose follows the steering sooner)
   reverseAngle: (110 * Math.PI) / 180, // input this far from the train heading backs up instead
   reverseMult: 0.6, // backing up is slower
   cartAttachDist: 21, // player center to first cart center

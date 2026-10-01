@@ -1286,6 +1286,7 @@ window.addEventListener('keyup', (e) => {
 window.addEventListener('blur', releaseAll);
 document.addEventListener('visibilitychange', () => {
   if (document.hidden && state.phase === 'playing') setPhase('paused');
+  sfx.setHidden(document.hidden);
 });
 
 // Taps and clicks on the canvas: menu buttons and HUD icons.
@@ -1448,6 +1449,244 @@ const sfx = (() => {
     src.start(t0);
   }
 
+  // ---- Music ----------------------------------------------------------
+  //
+  // Two looping chiptune songs, written as note data below and played by a
+  // small step sequencer (16th-note steps, scheduled a little ahead on the
+  // audio clock so timing stays tight). Music runs through its own bus,
+  // quieter than effects, so clanks and honks still read; muting the master
+  // mutes it too.
+  const NOTE_PC = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+  // Chords: bass root (MIDI) and chord shape.
+  const CHORDS = {
+    C: { root: 48, tones: [0, 4, 7] },
+    Am: { root: 45, tones: [0, 3, 7] },
+    F: { root: 41, tones: [0, 4, 7] },
+    G: { root: 43, tones: [0, 4, 7] },
+    E: { root: 40, tones: [0, 4, 7] },
+  };
+
+  // A melody line: one token per 8th note. "C5" plays a note, "_" holds the
+  // one before, "." rests, "|" is just a bar line for reading.
+  function parseLine(str) {
+    const toks = str.trim().split(/\s+/).filter((t) => t !== '|');
+    const events = new Map(); // step -> { midi, len } (len in 16th steps)
+    let held = null;
+    toks.forEach((tok, i) => {
+      if (tok === '_') {
+        if (held) held.len += 2;
+        return;
+      }
+      held = null;
+      if (tok === '.') return;
+      const m = /^([A-G])(#|b)?(\d)$/.exec(tok);
+      const pc = NOTE_PC[m[1]] + (m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0);
+      held = { midi: 12 * (Number(m[3]) + 1) + pc, len: 2 };
+      events.set(i * 2, held);
+    });
+    return events;
+  }
+
+  const SONGS = {
+    // Menus: a relaxed, bouncy shop jingle in C. Soft square melody, plucky
+    // bass, off-beat chord stabs and a light shaker.
+    menu: {
+      bpm: 100,
+      chords: ['C', 'Am', 'F', 'G', 'C', 'Am', 'F', 'G'],
+      lead: parseLine(`
+        E5 G5 .  E5 C5 D5 E5 .  | C5 _  A4 .  C5 E5 D5 .  |
+        C5 A4 .  C5 F5 E5 D5 C5 | D5 _  B4 .  G4 _  .  .  |
+        E5 G5 .  E5 C5 D5 E5 G5 | A5 _  G5 .  E5 C5 D5 .  |
+        F5 E5 D5 C5 A4 C5 D5 E5 | D5 _  _  B4 G4 _  .  .  |`),
+    },
+    // Gameplay: an arcade chiptune drive in A minor. Punchy square lead,
+    // pulsing octave bass, kick and noise snare.
+    game: {
+      bpm: 140,
+      chords: ['Am', 'F', 'C', 'G', 'Am', 'F', 'G', 'E'],
+      lead: parseLine(`
+        E5 _  A5 _  G5 E5 D5 C5 | C5 _  D5 _  E5 _  C5 A4 |
+        G4 _  C5 _  E5 D5 C5 E5 | D5 _  _  _  B4 _  G4 _  |
+        E5 _  A5 _  B5 _  C6 B5 | A5 _  G5 F5 E5 _  C5 _  |
+        D5 E5 F5 _  G5 _  B5 _  | G#5 _ _  _  B5 _  E5 _  |`),
+    },
+  };
+  for (const song of Object.values(SONGS)) song.steps = song.chords.length * 16;
+
+  const FRANTIC_TEMPO = 1.15; // last-stretch speed-up
+  const FRANTIC_KEY = 2; // and up a whole step
+  const MUSIC_LEVEL = 0.6;
+  const PAUSED_LEVEL = 0.18;
+
+  const midiHz = (m) => 440 * Math.pow(2, (m - 69) / 12);
+  let noiseBuf = null;
+  let musicBus = null; // { filter, gain }: shared by both songs, ducked while paused
+  const music = { want: null, opts: {}, cur: null, timer: null };
+
+  function voice(type, midi, t, dur, gain, dest) {
+    const osc = ac.createOscillator();
+    const g = ac.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(midiHz(midi), t);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(gain, t + 0.006);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + Math.max(0.03, dur));
+    osc.connect(g).connect(dest);
+    osc.start(t);
+    osc.stop(t + dur + 0.03);
+  }
+
+  function hit(t, dur, gain, freq, filterType, dest) {
+    if (!noiseBuf) {
+      noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    const src = ac.createBufferSource();
+    src.buffer = noiseBuf;
+    const f = ac.createBiquadFilter();
+    f.type = filterType;
+    f.frequency.value = freq;
+    const g = ac.createGain();
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(f).connect(g).connect(dest);
+    src.start(t, Math.random() * 0.5, dur + 0.02);
+  }
+
+  function kick(t, gain, dest) {
+    const osc = ac.createOscillator();
+    const g = ac.createGain();
+    osc.frequency.setValueAtTime(150, t);
+    osc.frequency.exponentialRampToValueAtTime(45, t + 0.12);
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
+    osc.connect(g).connect(dest);
+    osc.start(t);
+    osc.stop(t + 0.18);
+  }
+
+  // One 16th-note step of the menu song.
+  function stepMenu(song, step, t, sd, out) {
+    const bar = Math.floor(step / 16), s = step % 16;
+    const ch = CHORDS[song.chords[bar]];
+    const n = song.lead.get(step);
+    if (n) voice('square', n.midi, t, n.len * sd * 0.85, 0.05, out.lead);
+    if (s % 4 === 0) {
+      const bass = [0, 7, 12, 7][s / 4];
+      voice('triangle', ch.root + bass, t, sd * 1.6, 0.26, out.main);
+    }
+    if (s % 4 === 2) for (const k of ch.tones) voice('triangle', ch.root + 24 + k, t, sd * 0.9, 0.035, out.main);
+    if (s % 2 === 0) hit(t, 0.04, s % 4 === 2 ? 0.07 : 0.035, 6000, 'highpass', out.main);
+    if (s === 0 || s === 8) kick(t, 0.22, out.main);
+  }
+
+  // One 16th-note step of the gameplay song. In the final stretch it plays
+  // a step higher with doubled hats and a high alarm-like arpeggio.
+  function stepGame(song, step, t, sd, out, frantic) {
+    const bar = Math.floor(step / 16), s = step % 16;
+    const ch = CHORDS[song.chords[bar]];
+    const key = frantic ? FRANTIC_KEY : 0;
+    const n = song.lead.get(step);
+    if (n) {
+      voice('square', n.midi + key, t, n.len * sd * 0.9, 0.06, out.lead);
+      voice('triangle', n.midi + key - 12, t, n.len * sd * 0.9, 0.07, out.main);
+    }
+    if (s % 2 === 0) {
+      const oct = s % 4 === 0 ? 0 : 12;
+      voice('triangle', ch.root + key + oct, t, sd * 1.5, 0.3, out.main);
+      voice('square', ch.root + key + oct, t, sd * 1.2, 0.025, out.main);
+    }
+    if (s === 0 || s === 8 || s === 10) kick(t, 0.36, out.main);
+    const fill = bar === song.chords.length - 1 && s >= 12;
+    if (s === 4 || s === 12 || fill) {
+      hit(t, 0.12, fill && s !== 12 ? 0.12 : 0.2, 1800, 'bandpass', out.main);
+      voice('triangle', 52, t, 0.05, 0.08, out.main);
+    }
+    if (frantic || s % 2 === 0) hit(t, 0.03, s % 4 === 2 ? 0.08 : 0.045, 8000, 'highpass', out.main);
+    if (frantic) {
+      const k = ch.tones[[0, 1, 2, 1][s % 4]];
+      voice('square', ch.root + key + 36 + k, t, sd * 0.6, 0.022, out.main);
+    }
+  }
+
+  function ensureBus() {
+    if (musicBus) return musicBus;
+    const filter = ac.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 18000;
+    const gain = ac.createGain();
+    gain.gain.value = MUSIC_LEVEL;
+    filter.connect(gain).connect(master);
+    musicBus = { filter, gain };
+    return musicBus;
+  }
+
+  // Start a song from its first step, fading in over `fade` seconds.
+  function startSong(name, fade) {
+    const bus = ensureBus();
+    const main = ac.createGain();
+    main.gain.setValueAtTime(0.0001, ac.currentTime);
+    main.gain.exponentialRampToValueAtTime(1, ac.currentTime + Math.max(0.02, fade));
+    main.connect(bus.filter);
+    const lead = ac.createBiquadFilter(); // softens the square lead
+    lead.type = 'lowpass';
+    lead.frequency.value = name === 'menu' ? 2600 : 5000;
+    lead.connect(main);
+    music.cur = { name, song: SONGS[name], step: 0, next: ac.currentTime + 0.05, out: { main, lead } };
+    played.push(`music:${name}`);
+    if (played.length > 50) played.shift();
+  }
+
+  function stopSong() {
+    if (!music.cur) return;
+    const { main } = music.cur.out;
+    const t = ac.currentTime;
+    main.gain.cancelScheduledValues(t);
+    main.gain.setValueAtTime(main.gain.value, t);
+    main.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
+    setTimeout(() => main.disconnect(), 400);
+    music.cur = null;
+  }
+
+  // Schedule every step that falls in the next ~0.15 s of audio time.
+  function schedule() {
+    const c = music.cur;
+    if (!c) return;
+    const frantic = c.name === 'game' && music.opts.frantic;
+    const sd = 60 / (c.song.bpm * (frantic ? FRANTIC_TEMPO : 1)) / 4;
+    if (c.next < ac.currentTime) c.next = ac.currentTime + 0.02; // fell behind (tab was asleep): skip ahead
+    while (c.next < ac.currentTime + 0.15) {
+      if (c.name === 'menu') stepMenu(c.song, c.step, c.next, sd, c.out);
+      else stepGame(c.song, c.step, c.next, sd, c.out, frantic);
+      c.step = (c.step + 1) % c.song.steps;
+      c.next += sd;
+    }
+  }
+
+  // Which song should be playing: 'menu', 'game' or null, plus
+  // { frantic, paused }. Called every frame; only changes cause work.
+  function setMusic(name, opts = {}) {
+    music.want = name;
+    music.opts = opts;
+    if (!ac) return; // no audio until the first click or key press
+    if ((music.cur && music.cur.name) !== name) {
+      stopSong();
+      if (name) startSong(name, name === 'menu' ? 0.8 : 0.03);
+    }
+    const bus = ensureBus();
+    const t = ac.currentTime;
+    const level = opts.paused ? PAUSED_LEVEL : MUSIC_LEVEL;
+    const cutoff = opts.paused ? 900 : 18000;
+    if (bus.level !== level) {
+      bus.level = level;
+      bus.gain.gain.setTargetAtTime(level, t, 0.08);
+      bus.filter.frequency.setTargetAtTime(cutoff, t, 0.08);
+    }
+    if (!music.timer) music.timer = setInterval(schedule, 25);
+    schedule();
+  }
+
   function play(name, fn) {
     played.push(name);
     if (played.length > 50) played.shift();
@@ -1459,6 +1698,15 @@ const sfx = (() => {
     unlock,
     applyMute,
     played,
+    setMusic,
+    // A hidden tab slows timers to a crawl, which would make the music
+    // stutter; go quiet until the tab is back.
+    setHidden: (hidden) => {
+      if (!ac) return;
+      if (hidden) ac.suspend();
+      else ac.resume();
+    },
+    musicNow: () => (music.cur ? { name: music.cur.name, step: music.cur.step, ...music.opts } : null),
     contextState: () => (ac ? ac.state : 'not started'),
     // Cart latch: two detuned metal pings over a rattle.
     clank: () => play('clank', () => {
@@ -5101,6 +5349,28 @@ function draw() {
 // Loop: fixed-step update, render every frame
 // ---------------------------------------------------------------------------
 
+// Which song fits the current screen. Menus get the shop jingle; a shift
+// gets the gameplay song from GO (the countdown is silent), speeding up in
+// the final stretch and muffled while paused. The end-of-shift receipt waits
+// for the shift-over jingle before the menu song comes back; the Story
+// complete screen keeps just its fanfare.
+const MENU_MUSIC_PHASES = new Set(['title', 'howto', 'mode', 'levels', 'drinkIntro']);
+const OVER_JINGLE_WAIT = 1.6; // seconds
+const musicPhase = { phase: null, since: 0 };
+function updateMusic(now) {
+  if (musicPhase.phase !== state.phase) {
+    musicPhase.phase = state.phase;
+    musicPhase.since = now;
+  }
+  const phase = state.phase;
+  const frantic = state.timeLeft <= CONFIG.finalStretch;
+  if (MENU_MUSIC_PHASES.has(phase)) sfx.setMusic('menu');
+  else if (phase === 'over') sfx.setMusic(now - musicPhase.since > OVER_JINGLE_WAIT * 1000 ? 'menu' : null);
+  else if (phase === 'playing') sfx.setMusic('game', { frantic });
+  else if (phase === 'paused') sfx.setMusic('game', { frantic, paused: true });
+  else sfx.setMusic(null); // countdown, story complete
+}
+
 const STEP = 1 / 60;
 let last = performance.now();
 let acc = 0;
@@ -5112,6 +5382,7 @@ function frame(now) {
     update(STEP);
     acc -= STEP;
   }
+  updateMusic(now);
   draw();
   requestAnimationFrame(frame);
 }
